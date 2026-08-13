@@ -1,0 +1,23 @@
+[package]
+name = "orbiterm"
+version = "0.1.0"
+description = "A modern SSH and SFTP desktop client"
+authors = ["Orbiterm contributors"]
+edition = "2021"
+
+[lib]
+name = "orbiterm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+ssh2 = "0.9"
+keyring = { version = "3", features = ["windows-native"] }
+portable-pty = "0.9"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
