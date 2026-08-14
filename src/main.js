@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { allocateSessionId, appendRollingText, downloadTargetPath, duplicateBaseNames, escapeHtml, formatSize, isRetryableSftpCommand, joinRemote, normalizeRemotePath, parentPath, safeFileName, sanitizeImportedSession } from "./core.js";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
@@ -40,16 +41,11 @@ const state = {
   selectedRemote: null,
   selectedRemotePaths: new Set(),
   remoteSelectionAnchor: null,
-  transferStartedAt: 0,
   reconnectingTerminalId: null,
-  activeTransferId: null,
   activeTransferIds: new Set(),
   transferPromises: new Map(),
   transferTerminals: new Map(),
   transferMeta: new Map(),
-  activeTransferTerminalId: null,
-  activeTransferPromise: null,
-  transferPrefix: "",
   closing: false,
   remotePaths: new Map(),
   remoteEntriesByTerminal: new Map(),
@@ -111,7 +107,7 @@ document.querySelector("#app").innerHTML = `
         <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">文件</button>
         <div class="menu-popup">
           <button data-menu-action="new-session"><span><b>＋</b>新建 SSH 会话</span><kbd>Ctrl+Shift+T</kbd></button>
-          <button data-menu-action="local-ssh"><span><b>⌂</b>打开本地 PowerShell</span><kbd>Local</kbd></button>
+          <button data-menu-action="local-ssh"><span><b>⌂</b>打开本地终端</span><kbd>Local</kbd></button>
           <i></i>
           <button data-menu-action="import-sessions"><span><b>↙</b>导入会话配置</span></button>
           <button data-menu-action="export-sessions"><span><b>↗</b>导出会话配置</span></button>
@@ -198,7 +194,7 @@ document.querySelector("#app").innerHTML = `
         <div class="sftp-nav"><button id="remoteBack" title="后退" aria-label="后退">‹</button><button id="remoteForward" title="前进" aria-label="前进">›</button><button id="remoteUp" title="上一级" aria-label="上一级">↑</button><div class="sftp-address"><span>⌂</span><input id="remotePath" value="/" aria-label="远程路径" /><button id="copyRemotePath" title="复制路径" aria-label="复制路径">⧉</button></div><button id="remoteRefresh" title="刷新" aria-label="刷新">↻</button></div>
         <div class="file-header"><button data-sort="name">名称 <i></i></button><button data-sort="size">大小 <i></i></button><button data-sort="owner">归属用户 <i></i></button><button data-sort="modified">修改时间 <i></i></button><button data-sort="permissions">权限 <i></i></button></div>
         <div id="remoteFiles" class="remote-files"><div class="file-placeholder">连接后可浏览远程文件</div></div>
-        <div id="transferLog" class="transfer-log"><span class="transfer-icon">⇅</span><span id="transferText">暂无传输任务</span><div id="transferProgress" class="transfer-progress hidden"><i id="transferProgressBar"></i><small id="transferPercent"></small></div><button id="cancelTransfer" class="hidden">取消</button></div>
+        <div id="transferLog" class="transfer-log"><div class="transfer-log-head"><span class="transfer-icon">⇅</span><span id="transferText">暂无传输任务</span><button id="clearTransfers" class="hidden">清空</button><button id="cancelTransfer" class="hidden">全部取消</button></div><div id="transferList" class="transfer-list hidden"></div></div>
       </aside>
       <aside id="tailPanel" class="drawer-panel tail-panel hidden" aria-label="Tail 日志查看"><div class="drawer-resize" data-resize-drawer="tail" title="拖动调整宽度"></div><div class="tail-head"><span><strong>Tail 日志</strong><small id="tailHost">未连接</small></span><button id="closeTail" aria-label="关闭日志查看">×</button></div><div class="tail-browser"><button id="tailUp" title="上一级">↑</button><div><input id="tailPath" aria-label="日志路径" placeholder="输入目录或日志文件绝对路径" /><button id="tailRefresh" title="刷新目录">↻</button></div></div><div id="tailFiles" class="tail-files hidden"><div>点击路径栏选择日志文件</div></div><div class="tail-config"><select id="tailDirection" aria-label="行号方向"><option value="last">-N 末尾</option><option value="first">+N 开头</option></select><input id="tailLines" type="number" min="1" placeholder="默认" aria-label="行数，留空使用 tail 默认值" /><label><input id="tailFollow" type="checkbox" checked /> -f</label><button id="startTail" class="primary">查看</button><button id="pauseTail" disabled>暂停</button></div><div class="tail-search"><span id="tailSelectedFile">尚未选择文件</span><input id="tailSearch" placeholder="搜索日志" /><button id="tailSearchPrevious" title="上一个">↑</button><button id="tailSearchNext" title="下一个">↓</button><small id="tailSearchCount"></small></div><div id="tailOutput" class="tail-output"><div class="tail-empty">请输入绝对路径或从目录中选择文件</div></div></aside>
       <aside id="manualPanel" class="drawer-panel manual-panel hidden" aria-label="Linux 命令手册"><div class="drawer-resize" data-resize-drawer="manual" title="拖动调整宽度"></div><div class="tail-head"><span><strong>Linux 命令手册</strong><small>选择左侧命令查看用法</small></span><button id="closeCommandManual" aria-label="关闭命令手册">×</button></div><div class="manual-search"><span>⌕</span><input id="commandSearch" placeholder="搜索命令、分类或用途" /></div><div class="manual-browser"><nav id="commandList" class="command-list"></nav><article id="commandDetail" class="command-detail"></article></div></aside>
@@ -244,7 +240,7 @@ document.querySelector("#app").innerHTML = `
           <div class="field full"><label for="name">连接名称</label><input id="name" required placeholder="例如：生产服务器" /></div>
           <div class="form-grid host-grid"><div class="field"><label for="host">IP / 主机地址</label><input id="host" required placeholder="服务器 IP 或域名" /></div><div class="field"><label for="port">端口</label><input id="port" type="number" min="1" max="65535" value="22" required /></div></div>
           <div class="field full"><label for="username">用户名</label><input id="username" required placeholder="root" /></div>
-          <div id="passwordFields" class="field full"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" placeholder="输入 SSH 登录密码" /><label class="inline-check"><input id="rememberPassword" type="checkbox" /> 使用 Windows 凭据管理器记住密码</label></div>
+          <div id="passwordFields" class="field full"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" placeholder="输入 SSH 登录密码" /><label class="inline-check"><input id="rememberPassword" type="checkbox" /> 使用系统安全凭据库记住密码</label></div>
         </section>
         <section class="session-form-page hidden" data-session-page="auth">
           <div class="field full"><label for="authType">认证方式</label><select id="authType"><option value="password">密码认证</option><option value="publickey">SSH 私钥</option><option value="agent">SSH Agent</option></select></div>
@@ -342,10 +338,6 @@ function setSidebarCollapsed(collapsed) {
 
 function persistSessions() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state.sessions));
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
 const BOOTSTRAP_MARKER = encoder.encode("\x1b]777;orbiterm-ready\x07");
@@ -662,7 +654,7 @@ function closeSessionModal() {
 async function openLocalSshModal() {
   const session = {
     id: crypto.randomUUID(),
-    name: "本地 PowerShell",
+    name: "本地终端",
     host: "本机",
     port: 0,
     username: "",
@@ -707,7 +699,7 @@ function applyInterfaceLanguage() {
   document.querySelectorAll(".menu-trigger").forEach((node, index) => { if (menuLabels[index]) node.textContent = english ? menuLabels[index][1] : menuLabels[index][0]; });
   document.querySelector(".menubar")?.setAttribute("aria-label", english ? "Application menu" : "应用菜单");
   const actions = {
-    "new-session": ["新建 SSH 会话", "New SSH Session"], "local-ssh": ["打开本地 PowerShell", "Open Local PowerShell"], "import-sessions": ["导入会话配置", "Import Sessions"], "export-sessions": ["导出会话配置", "Export Sessions"], exit: ["退出 Orbiterm", "Exit Orbiterm"],
+    "new-session": ["新建 SSH 会话", "New SSH Session"], "local-ssh": ["打开本地终端", "Open Local Terminal"], "import-sessions": ["导入会话配置", "Import Sessions"], "export-sessions": ["导出会话配置", "Export Sessions"], exit: ["退出 Orbiterm", "Exit Orbiterm"],
     copy: ["复制", "Copy"], paste: ["粘贴", "Paste"], "select-all": ["全选终端内容", "Select All"], find: ["查找终端内容", "Find"], "toggle-sidebar": ["会话管理器", "Session Manager"], "toggle-sftp": ["SFTP 文件管理器", "SFTP File Manager"], fullscreen: ["全屏", "Full Screen"], reconnect: ["重新连接", "Reconnect"], clear: ["清除屏幕", "Clear Screen"], "toggle-log": ["开始/停止命令记录", "Start/Stop Logging"], "close-terminal": ["关闭当前标签", "Close Current Tab"], upload: ["上传文件到当前目录", "Upload to Current Folder"], settings: ["应用设置", "Application Settings"], guide: ["使用说明", "User Guide"], "command-manual": ["Linux 命令手册", "Linux Command Manual"], shortcuts: ["快捷键说明", "Keyboard Shortcuts"], about: ["关于 Orbiterm", "About Orbiterm"],
   };
   document.querySelectorAll("[data-menu-action]").forEach((button) => { const label = actions[button.dataset.menuAction]; const span = button.querySelector("span"); if (!label || !span) return; const icon = span.querySelector("b")?.outerHTML || ""; span.innerHTML = `${icon}${english ? label[1] : label[0]}`; });
@@ -741,9 +733,9 @@ function applyInterfaceLanguage() {
     ["配置远程服务器连接", "Configure a remote server connection"], ["首次连接会自动保存服务器主机指纹；以后指纹变化时会阻止连接。", "The server host key is saved automatically on first connection. A changed key will block future connections."], ["留空时读取远端账户的默认登录 Shell；仅在需要指定 Bash、Zsh 或启动 tmux 时填写。", "Leave empty to use the remote account's default login shell. Set this only to start Bash, Zsh, tmux, or another command."],
     ["远程文件", "Remote files"], ["未连接", "Disconnected"], ["上传", "Upload"], ["↑ 上传", "↑ Upload"], ["下载", "Download"], ["↓ 下载", "↓ Download"], ["新建", "New"], ["＋ 新建", "+ New"], ["新建文件", "New file"], ["新建文件夹", "New folder"], ["名称", "Name"], ["大小", "Size"], ["归属用户", "Owner"], ["修改时间", "Modified"], ["权限", "Permissions"], ["暂无传输任务", "No transfers"], ["取消传输", "Cancel transfer"], ["连接后可浏览远程文件", "Connect to browse remote files"], ["0 项", "0 items"],
     ["Tail 日志", "Tail Logs"], ["查看", "View"], ["暂停", "Pause"], ["尚未选择文件", "No file selected"], ["点击路径栏选择日志文件", "Click the path field to select a log file"], ["请输入绝对路径或从目录中选择文件", "Enter an absolute path or select a file from a folder"], ["-N 末尾", "-N From end"], ["+N 开头", "+N From start"], ["默认", "Default"], ["Linux 命令手册", "Linux Command Manual"], ["选择左侧命令查看用法", "Select a command to view details"], ["关闭", "Close"], ["行号", "Line numbers"], ["编辑", "Edit"], ["保存到远端", "Save remotely"], ["多行粘贴", "Multi-line paste"], ["合并换行为空格", "Join lines with spaces"], ["发送到终端", "Send to terminal"],
-    ["复制", "Copy"], ["粘贴", "Paste"], ["全选", "Select all"], ["查找", "Find"], ["清屏", "Clear screen"], ["复制会话标签", "Duplicate session tab"], ["新连接", "New connection"], ["断开连接", "Disconnect"], ["重新连接", "Reconnect"], ["关闭标签", "Close tab"], ["打开", "Open"], ["重命名", "Rename"], ["修改权限", "Change permissions"], ["属性", "Properties"], ["删除", "Delete"],
+    ["复制", "Copy"], ["粘贴", "Paste"], ["全选", "Select all"], ["查找", "Find"], ["清屏", "Clear screen"], ["清空", "Clear"], ["全部取消", "Cancel all"], ["复制会话标签", "Duplicate session tab"], ["新连接", "New connection"], ["断开连接", "Disconnect"], ["重新连接", "Reconnect"], ["关闭标签", "Close tab"], ["打开", "Open"], ["重命名", "Rename"], ["修改权限", "Change permissions"], ["属性", "Properties"], ["删除", "Delete"],
     ["远程文件内容", "Remote file content"], ["远程文件", "Remote file"], ["0 字符", "0 characters"], ["查找内容", "Find content"], ["正在读取远程文件…", "Reading remote file…"],
-    ["使用 Windows 凭据管理器记住密码", "Remember password in Windows Credential Manager"], ["终端切换目录时同步 SFTP 路径", "Sync SFTP path with terminal directory"], ["浅色", "Light"], ["深色", "Dark"], ["简体中文", "简体中文"], ["浅色终端", "Light terminal"], ["深色终端", "Dark terminal"],
+    ["使用系统安全凭据库记住密码", "Remember password in the system credential store"], ["终端切换目录时同步 SFTP 路径", "Sync SFTP path with terminal directory"], ["浅色", "Light"], ["深色", "Dark"], ["简体中文", "简体中文"], ["浅色终端", "Light terminal"], ["深色终端", "Dark terminal"],
   ];
   const sourceIndex = english ? 0 : 1;
   const targetIndex = english ? 1 : 0;
@@ -760,6 +752,7 @@ function applyInterfaceLanguage() {
   };
   Object.entries(placeholders).forEach(([id, pair]) => { if (el(id)) el(id).placeholder = english ? pair[1] : pair[0]; });
   if (!state.activeTransferIds.size) el("transferStatus").textContent = english ? "Transfer: idle" : "传输：空闲";
+  renderTransfers();
   if (!el("manualPanel").classList.contains("hidden")) void renderCommandManual("drawer");
   updateActiveStatus();
 }
@@ -886,7 +879,7 @@ function createTerminalView(session) {
     if (!host.isConnected) return;
     requestAnimationFrame(() => fit.fit());
   });
-  terminal.writeln(session.local ? "正在启动本地 PowerShell…" : `Connecting to ${session.host}:${session.port}...`);
+  terminal.writeln(session.local ? "正在启动本地终端…" : `Connecting to ${session.host}:${session.port}...`);
 
   const record = { id, session, terminal, fit, fitObserver, search, host, connected: false, stopped: false, logging: false, logPath: "", latency: null, writeChain: Promise.resolve(), resizeTimer: null, inputTimer: null, inputQueue: [], inputBytes: 0, cwdSyncTimer: null, bootstrapPending: false, bootstrapInstalling: false, bootstrapInstalled: false, bootstrapWanted: false, bootstrapBuffer: new Uint8Array(), bootstrapTimer: null, bootstrapFallbackTimer: null, sftpHistory: ["/"], sftpHistoryIndex: 0, tailFile: "", tailOffset: 0, tailInitialized: false, tailOutputText: "" };
   state.terminals.set(id, record);
@@ -1020,6 +1013,7 @@ async function connectLocalTerminal(session) {
       rows: record.terminal.rows,
     });
     record.connected = true;
+    record.session.localShell = shell;
     record.latency = 0;
     record.terminal.clear();
     record.terminal.writeln(`本地终端 · ${shell}`);
@@ -1032,7 +1026,7 @@ async function connectLocalTerminal(session) {
     record.connected = false;
     updateTerminalState(record, "error");
     record.terminal.writeln(`\r\n\x1b[31m启动本地终端失败：${String(error)}\x1b[0m`);
-    toast("启动本地 PowerShell 失败", "error");
+    toast("启动本地终端失败", "error");
     updateActiveStatus();
     return null;
   }
@@ -1040,11 +1034,15 @@ async function connectLocalTerminal(session) {
 
 async function connectSavedSession(session) {
   if (!session) return;
+  if (!session.fingerprint || session.authType === "publickey") return openSessionModal(session, "connect");
   let secret = "";
   if (session.authType === "password") {
     if (session.rememberPassword) {
       try { secret = await invoke("credential_get", { sessionId: session.id }) || ""; }
-      catch (error) { return toast(String(error), "error"); }
+      catch (error) {
+        toast(`${String(error)}；请手动输入密码`, "error");
+        return openSessionModal(session, "connect");
+      }
     }
     if (!secret) return openSessionModal(session, "connect");
   }
@@ -1196,20 +1194,16 @@ function updateActiveStatus() {
   const english = state.preferences.language === "en-US";
   const statusText = english ? { connecting: "Connecting", connected: "Connected", disconnected: "Disconnected", error: "Connection failed" } : { connecting: "连接中", connected: "已连接", disconnected: "已断开", error: "连接失败" };
   el("connectionStatus").textContent = record ? statusText[record.status] || statusText.disconnected : (english ? "Disconnected" : "未连接");
-  el("statusHost").textContent = record ? record.session.local ? "本地 PowerShell" : `${record.session.username}@${record.session.host}:${record.session.port}` : "—";
+  el("statusHost").textContent = record ? record.session.local ? `本地 ${record.session.localShell || "Shell"}` : `${record.session.username}@${record.session.host}:${record.session.port}` : "—";
   el("latencyStatus").textContent = record?.session.local ? (english ? "Local" : "本地") : `${english ? "Latency" : "延迟"}：${connected ? `${record.latency} ms` : "—"}`;
   el("terminalSize").textContent = record ? `${record.terminal.cols} × ${record.terminal.rows}` : "—";
   el("logStatus").textContent = record?.logging ? (english ? "Log: recording" : "日志：记录中") : (english ? "Log: off" : "日志：关闭");
 }
 
-function safeFileName(value) {
-  return value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim() || "session";
-}
-
 async function toggleSessionLog() {
   const record = activeTerminal();
   if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  if (record.session.local) return toast("本地 PowerShell 暂不使用 SSH 会话日志", "error");
+  if (record.session.local) return toast("本地终端暂不使用 SSH 会话日志", "error");
   try {
     if (record.logging) {
       await invoke("session_log_stop", { id: record.id });
@@ -1230,43 +1224,8 @@ async function toggleSessionLog() {
   }
 }
 
-function parentPath(path) {
-  const parts = path.split("/").filter(Boolean);
-  parts.pop();
-  return `/${parts.join("/")}` || "/";
-}
-
-function normalizeRemotePath(value, base = "/") {
-  const input = value.trim().replaceAll("\\", "/");
-  const combined = input.startsWith("/") ? input : `${base.replace(/\/$/, "")}/${input}`;
-  const parts = [];
-  for (const part of combined.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") parts.pop();
-    else parts.push(part);
-  }
-  return `/${parts.join("/")}`;
-}
-
-function joinRemote(base, name) {
-  return normalizeRemotePath(name, base);
-}
-
-function joinLocal(base, name) {
-  const separator = base.includes("\\") ? "\\" : "/";
-  return `${base.replace(/[\\/]$/, "")}${separator}${name}`;
-}
-
 function selectedRemoteEntries() {
   return state.remoteEntries.filter((entry) => state.selectedRemotePaths.has(entry.path));
-}
-
-function formatSize(size) {
-  if (size === 0) return "0 B";
-  if (!Number.isFinite(size) || size < 0) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const index = Math.min(Math.floor(Math.log(size) / Math.log(1024)), units.length - 1);
-  return `${(size / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
 function fileIcon(entry) {
@@ -1304,11 +1263,11 @@ function renderRemoteEntries(entries, emptyText = "此目录为空") {
 function updateSftpControls(loading = false) {
   const record = activeTerminal();
   const connected = Boolean(record?.connected && !record.session.local);
-  const busy = Boolean(state.activeTransferId);
+  const busy = state.activeTransferIds.size > 0;
   const selectedItems = selectedRemoteEntries();
   el("sftpHost").textContent = connected ? `${record.session.username}@${record.session.host}` : "未连接";
   el("uploadFile").disabled = !connected || busy;
-  el("downloadFile").disabled = !connected || !selectedItems.length;
+  el("downloadFile").disabled = !connected || !selectedItems.length || busy;
   el("newRemote").disabled = !connected || busy;
   el("remoteUp").disabled = !connected || loading || state.remotePath === "/";
   el("remoteBack").disabled = !connected || loading || record.sftpHistoryIndex <= 0;
@@ -1324,11 +1283,15 @@ async function invokeSftpWithReconnect(command, args, terminalId) {
   try {
     return await invoke(command, args);
   } catch (firstError) {
+    if (!isRetryableSftpCommand(command)) {
+      await invoke("sftp_reconnect", { id: terminalId }).catch(() => {});
+      throw firstError;
+    }
     try {
       await invoke("sftp_reconnect", { id: terminalId });
       return await invoke(command, args);
     } catch (retryError) {
-      throw retryError || firstError;
+      throw retryError ?? firstError;
     }
   }
 }
@@ -1372,56 +1335,119 @@ async function refreshRemote(nextPath = null, trackHistory = true) {
   }
 }
 
-function setTransfer(message, active = false, percent = null) {
-  el("transferText").textContent = message;
+function transferPending(meta) {
+  return ["queued", "running", "cancelling"].includes(meta.status);
+}
+
+function renderTransfers() {
+  const tasks = [...state.transferMeta.entries()];
+  const active = tasks.filter(([, meta]) => transferPending(meta));
+  const completed = tasks.filter(([, meta]) => meta.status === "completed").length;
+  const unsuccessful = tasks.filter(([, meta]) => ["cancelled", "error"].includes(meta.status)).length;
   const english = state.preferences.language === "en-US";
-  el("transferStatus").textContent = active
+  el("transferText").textContent = active.length
+    ? (english ? `${active.length} transfer${active.length === 1 ? "" : "s"} active` : `${active.length} 个任务正在传输`)
+    : tasks.length
+      ? (english ? `${completed} completed${unsuccessful ? ` · ${unsuccessful} incomplete` : ""}` : `传输完成 ${completed} 项${unsuccessful ? ` · 未完成 ${unsuccessful} 项` : ""}`)
+      : (english ? "No transfer tasks" : "暂无传输任务");
+  el("transferStatus").textContent = active.length
     ? (english ? "Transfer: active" : "传输：进行中")
     : (english ? "Transfer: idle" : "传输：空闲");
-  el("transferProgress").classList.toggle("hidden", !active);
-  el("transferProgress").classList.toggle("indeterminate", active && percent == null);
-  el("cancelTransfer").classList.toggle("hidden", !active);
-  const value = percent == null ? 0 : Math.max(0, Math.min(percent, 100));
-  el("transferProgressBar").style.width = `${value}%`;
-  el("transferPercent").textContent = active && percent != null ? `${Math.round(value)}%` : "";
+  el("cancelTransfer").classList.toggle("hidden", !active.length);
+  el("clearTransfers").classList.toggle("hidden", !tasks.length || Boolean(active.length));
+  el("transferList").classList.toggle("hidden", !tasks.length);
+  const labels = english
+    ? { queued: "Queued", running: "Transferring", cancelling: "Cancelling", completed: "Completed", cancelled: "Cancelled", error: "Failed" }
+    : { queued: "等待中", running: "传输中", cancelling: "正在取消", completed: "已完成", cancelled: "已取消", error: "失败" };
+  el("transferList").innerHTML = tasks.map(([transferId, meta]) => {
+    const total = Number(meta.total) || 0;
+    const transferred = Number(meta.transferred) || 0;
+    const percent = total > 0 ? Math.max(0, Math.min(transferred / total * 100, 100)) : meta.status === "completed" ? 100 : 0;
+    const seconds = Math.max((performance.now() - meta.startedAt) / 1000, 0.01);
+    const speed = meta.status === "running" && transferred ? ` · ${formatSize(transferred / seconds)}/s` : "";
+    const size = total ? `${formatSize(transferred)} / ${formatSize(total)}` : transferred ? formatSize(transferred) : "";
+    const detail = [labels[meta.status] || meta.status, size].filter(Boolean).join(" · ") + speed;
+    const indeterminate = meta.status === "running" && !total ? " indeterminate" : "";
+    const cancellable = ["queued", "running"].includes(meta.status);
+    const progressLabel = total || meta.status === "completed" ? `${Math.round(percent)}%` : "";
+    const cancelTitle = english ? "Cancel only this task" : "只取消此任务";
+    return `<div class="transfer-task" data-status="${escapeHtml(meta.status)}" data-kind="${escapeHtml(meta.kind)}" title="${escapeHtml(meta.error || meta.name)}"><span class="transfer-task-direction">${meta.kind === "上传" ? "↑" : "↓"}</span><div class="transfer-task-main"><div class="transfer-task-info"><b>${escapeHtml(meta.name)}</b><small>${escapeHtml(detail)}</small></div><div class="transfer-progress${indeterminate}"><i style="width:${percent}%"></i><small>${progressLabel}</small></div></div>${cancellable ? `<button data-cancel-transfer="${escapeHtml(transferId)}" title="${cancelTitle}" aria-label="${cancelTitle} ${escapeHtml(meta.name)}">×</button>` : ""}</div>`;
+  }).join("");
   updateSftpControls();
 }
 
-function registerTransfer(transferId, terminalId, promise, meta) {
-  state.activeTransferId = transferId;
+function queueTransfer(transferId, terminalId, meta, shouldRender = true) {
   state.activeTransferIds.add(transferId);
-  state.transferPromises.set(transferId, promise);
   state.transferTerminals.set(transferId, terminalId);
-  state.transferMeta.set(transferId, { transferred: 0, total: 0, ...meta, startedAt: performance.now() });
+  state.transferMeta.set(transferId, { transferred: 0, total: 0, status: "queued", cancelRequested: false, ...meta, startedAt: performance.now() });
+  if (shouldRender) renderTransfers();
 }
 
-function unregisterTransfer(transferId, retainProgress = false) {
+function startTransfer(transferId, promise) {
+  const meta = state.transferMeta.get(transferId);
+  if (!meta) return;
+  meta.status = "running";
+  meta.startedAt = performance.now();
+  state.transferPromises.set(transferId, promise);
+  renderTransfers();
+}
+
+function finishTransfer(transferId, status, error = "") {
+  const meta = state.transferMeta.get(transferId);
+  if (meta) {
+    meta.status = status;
+    meta.error = error;
+    if (status === "completed" && !meta.total) meta.total = meta.transferred;
+  }
   state.activeTransferIds.delete(transferId);
   state.transferPromises.delete(transferId);
   state.transferTerminals.delete(transferId);
-  if (!retainProgress) state.transferMeta.delete(transferId);
-  if (state.activeTransferId === transferId) {
-    state.activeTransferId = [...state.activeTransferIds].at(-1) || null;
-  }
+  renderTransfers();
 }
 
-function finishTransferBatch(message) {
-  if (state.activeTransferIds.size) {
-    setTransfer(`${message} · 另有 ${state.activeTransferIds.size} 个任务正在传输`, true);
-  } else {
-    setTransfer(message);
-    state.activeTransferTerminalId = null;
-    state.activeTransferPromise = null;
-    state.transferPrefix = "";
+async function cancelTransferTask(transferId) {
+  const meta = state.transferMeta.get(transferId);
+  if (!meta || !transferPending(meta) || meta.cancelRequested) return;
+  meta.cancelRequested = true;
+  if (meta.status === "queued") {
+    finishTransfer(transferId, "cancelled");
+    return;
   }
+  meta.status = "cancelling";
+  renderTransfers();
+  await invoke("cancel_transfer", { transferId }).catch(() => {});
+  [150, 500, 1200].forEach((delay) => setTimeout(() => {
+    if (state.transferMeta.get(transferId)?.status === "cancelling") {
+      void invoke("cancel_transfer", { transferId }).catch(() => {});
+    }
+  }, delay));
+}
+
+async function cancelAllTransfers() {
+  await Promise.all([...state.activeTransferIds].map(cancelTransferTask));
+}
+
+function clearFinishedTransfers() {
+  if (state.activeTransferIds.size) return;
+  state.transferMeta.clear();
+  renderTransfers();
+}
+
+function resetTransferList() {
+  if (!state.activeTransferIds.size) state.transferMeta.clear();
 }
 
 async function uploadPaths(localPaths) {
   const record = activeTerminal();
   if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  if (state.activeTransferId) return toast("请等待当前传输完成");
+  if (state.activeTransferIds.size) return toast("请等待当前传输完成");
   if (!localPaths.length) return;
   const names = localPaths.map((path) => path.replaceAll("\\", "/").split("/").pop());
+  const duplicates = duplicateBaseNames(localPaths);
+  if (duplicates.length) {
+    const preview = duplicates.slice(0, 5).join("、");
+    return toast(`所选文件中存在同名项：${preview}。请分批上传或先重命名`, "error");
+  }
   const conflicts = names.filter((name) => state.remoteEntries.some((entry) => entry.name === name));
   if (conflicts.length) {
     const preview = conflicts.slice(0, 5).join("、");
@@ -1429,44 +1455,54 @@ async function uploadPaths(localPaths) {
     const overwrite = await appPrompt({ title: "覆盖远程文件", message: `远程目录中已存在 ${preview}${suffix}，是否全部覆盖？`, input: false, confirmText: "全部覆盖" });
     if (!overwrite) return;
   }
-  state.activeTransferTerminalId = record.id;
+  resetTransferList();
   const started = performance.now();
   let totalBytes = 0;
   let completed = 0;
-  const transferIds = [];
-  try {
-    let nextIndex = 0;
-    const worker = async () => { while (nextIndex < localPaths.length) {
-      const index = nextIndex++;
-      const localPath = localPaths[index];
-      const name = names[index];
-      const transferId = crypto.randomUUID();
-      transferIds.push(transferId);
-      state.transferPrefix = localPaths.length > 1 ? `${index + 1}/${localPaths.length} · ` : "";
-      state.transferStartedAt = performance.now();
-      setTransfer(`${state.transferPrefix}正在上传 ${name}…`, true);
-      const transferPromise = invoke("sftp_upload", { id: record.id, transferId, localPath, remotePath: joinRemote(state.remotePath, name) });
-      registerTransfer(transferId, record.id, transferPromise, { prefix: state.transferPrefix, name });
-      state.activeTransferPromise = transferPromise;
+  let cancelled = 0;
+  const errors = [];
+  const tasks = localPaths.map((localPath, index) => ({ transferId: crypto.randomUUID(), localPath, name: names[index] }));
+  tasks.forEach((task) => queueTransfer(task.transferId, record.id, { name: task.name, kind: "上传" }, false));
+  renderTransfers();
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < tasks.length) {
+      const task = tasks[nextIndex++];
+      const meta = state.transferMeta.get(task.transferId);
+      if (!meta || meta.cancelRequested || meta.status === "cancelled") {
+        cancelled += 1;
+        continue;
+      }
+      const transferPromise = invoke("sftp_upload", { id: record.id, transferId: task.transferId, localPath: task.localPath, remotePath: joinRemote(state.remotePath, task.name) });
+      startTransfer(task.transferId, transferPromise);
       try {
         totalBytes += await transferPromise;
         completed += 1;
-      } finally {
-        unregisterTransfer(transferId, true);
+        finishTransfer(task.transferId, "completed");
+      } catch (error) {
+        const message = String(error);
+        if (meta.cancelRequested || message === "传输已取消") {
+          cancelled += 1;
+          finishTransfer(task.transferId, "cancelled");
+        } else {
+          errors.push({ name: task.name, message });
+          finishTransfer(task.transferId, "error", message);
+        }
       }
-    } };
-    const results = await Promise.allSettled(Array.from({ length: Math.min(3, localPaths.length) }, worker));
-    const failure = results.find((result) => result.status === "rejected");
-    if (failure) throw failure.reason;
-    const seconds = Math.max((performance.now() - started) / 1000, 0.01);
-    finishTransferBatch(`✓ 已上传 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, tasks.length) }, worker));
+  const seconds = Math.max((performance.now() - started) / 1000, 0.01);
+  if (errors.length) {
+    toast(`上传完成 ${completed} 项，失败 ${errors.length} 项；可将鼠标停在失败任务上查看原因`, "error");
+  } else if (cancelled) {
+    toast(`上传完成 ${completed} 项，取消 ${cancelled} 项`);
+  } else {
     toast(`${completed} 个文件上传完成`, "success");
-    refreshRemote();
-  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? `上传已取消 · 已完成 ${completed}/${localPaths.length}` : `上传失败 · 已完成 ${completed}/${localPaths.length}：${String(error)}`); toast(String(error), "error"); }
-  finally {
-    transferIds.forEach((transferId) => state.transferMeta.delete(transferId));
-    updateSftpControls();
   }
+  if (completed) refreshRemote();
+  el("transferText").title = `共 ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`;
+  renderTransfers();
 }
 
 async function uploadFile() {
@@ -1580,48 +1616,58 @@ async function downloadFile() {
   const items = selectedRemoteEntries();
   if (!record?.connected) return toast("请先连接 SSH 会话", "error");
   if (!items.length) return toast("请选择要下载的文件", "error");
+  if (state.activeTransferIds.size) return toast("请等待当前传输完成");
   const destination = items.length === 1 && !items[0].isDir
     ? await save({ defaultPath: items[0].name })
     : await open({ directory: true, multiple: false, title: `选择 ${items.length} 个文件的保存目录` });
   if (!destination) return;
-  state.activeTransferTerminalId = record.id;
+  resetTransferList();
   const started = performance.now();
   let totalBytes = 0;
   let completed = 0;
-  const transferIds = [];
-  try {
-    let nextIndex = 0;
-    const worker = async () => {
-      while (nextIndex < items.length) {
-      const index = nextIndex++;
-      const item = items[index];
-      const transferId = crypto.randomUUID();
-      transferIds.push(transferId);
-      const localPath = items.length === 1 ? destination : joinLocal(destination, item.name);
-      const prefix = items.length > 1 ? `${index + 1}/${items.length} · ` : "";
-      setTransfer(`${prefix}正在下载 ${item.name}…`, true);
-      const transferPromise = invoke(item.isDir ? "sftp_download_tree" : "sftp_download", { id: record.id, transferId, remotePath: item.path, localPath });
-      registerTransfer(transferId, record.id, transferPromise, { prefix, name: item.name, kind: "下载", total: item.isDir ? 0 : item.size });
-      state.activeTransferPromise = Promise.allSettled([...state.transferPromises.values()]);
+  let cancelled = 0;
+  const errors = [];
+  const tasks = items.map((item) => ({ item, transferId: crypto.randomUUID(), localPath: downloadTargetPath(destination, item, items.length) }));
+  tasks.forEach(({ item, transferId }) => queueTransfer(transferId, record.id, { name: item.name, kind: "下载", total: item.isDir ? 0 : item.size }, false));
+  renderTransfers();
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < tasks.length) {
+      const task = tasks[nextIndex++];
+      const meta = state.transferMeta.get(task.transferId);
+      if (!meta || meta.cancelRequested || meta.status === "cancelled") {
+        cancelled += 1;
+        continue;
+      }
+      const transferPromise = invoke(task.item.isDir ? "sftp_download_tree" : "sftp_download", { id: record.id, transferId: task.transferId, remotePath: task.item.path, localPath: task.localPath });
+      startTransfer(task.transferId, transferPromise);
       try {
         totalBytes += await transferPromise;
         completed += 1;
-      } finally {
-        unregisterTransfer(transferId, true);
-      }
+        finishTransfer(task.transferId, "completed");
+      } catch (error) {
+        const message = String(error);
+        if (meta.cancelRequested || message === "传输已取消") {
+          cancelled += 1;
+          finishTransfer(task.transferId, "cancelled");
+        } else {
+          errors.push({ name: task.item.name, message });
+          finishTransfer(task.transferId, "error", message);
+        }
       }
     }
-    const results = await Promise.allSettled(Array.from({ length: items.length }, worker));
-    const failure = results.find((result) => result.status === "rejected");
-    if (failure) throw failure.reason;
-    const seconds = Math.max((performance.now() - started) / 1000, 0.01);
-    finishTransferBatch(`✓ 已下载 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`);
+  };
+  await Promise.all(Array.from({ length: Math.min(3, tasks.length) }, worker));
+  const seconds = Math.max((performance.now() - started) / 1000, 0.01);
+  if (errors.length) {
+    toast(`下载完成 ${completed} 项，失败 ${errors.length} 项；可将鼠标停在失败任务上查看原因`, "error");
+  } else if (cancelled) {
+    toast(`下载完成 ${completed} 项，取消 ${cancelled} 项`);
+  } else {
     toast(`${completed} 个文件下载完成`, "success");
-  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? `下载已取消 · 已完成 ${completed}/${items.length}` : `下载失败 · 已完成 ${completed}/${items.length}：${String(error)}`); toast(String(error), "error"); }
-  finally {
-    transferIds.forEach((transferId) => state.transferMeta.delete(transferId));
-    updateSftpControls();
   }
+  el("transferText").title = `共 ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`;
+  renderTransfers();
 }
 
 async function createFolder() {
@@ -1777,7 +1823,7 @@ async function refreshTail(reset = false) {
       if (record.id !== state.activeId || el("tailPanel").classList.contains("hidden")) return;
       record.tailOffset = offset;
       record.tailInitialized = true;
-      record.tailOutputText = output || "";
+      record.tailOutputText = appendRollingText("", output || "");
       state.tailOutputText = record.tailOutputText;
       renderTailOutput(true);
     } else {
@@ -1790,7 +1836,7 @@ async function refreshTail(reset = false) {
       }
       record.tailOffset = append.offset;
       if (append.content) {
-        record.tailOutputText += append.content;
+        record.tailOutputText = appendRollingText(record.tailOutputText, append.content);
         state.tailOutputText = record.tailOutputText;
         renderTailOutput(false);
       }
@@ -1939,7 +1985,7 @@ function updateMenuStates() {
     clear: !record,
     "toggle-log": !record?.connected,
     "close-terminal": !record,
-    upload: !record?.connected || Boolean(state.activeTransferId),
+    upload: !record?.connected || Boolean(state.activeTransferIds.size),
     "export-sessions": !state.sessions.length,
   };
   Object.entries(states).forEach(([action, disabled]) => {
@@ -2072,13 +2118,13 @@ async function runMenuAction(action) {
 function helpContents(section) {
   const english = state.preferences.language === "en-US";
   const contents = english ? {
-    guide: ["User Guide", `<div class="help-hero"><span>›_</span><div><h2>Start working quickly</h2><p>Manage SSH sessions, local PowerShell, files and logs in one window.</p></div></div><div class="help-card-grid"><section><h3>1 · Connect</h3><p>Create an SSH session or double-click a saved session. Passwords are stored only in Windows Credential Manager when requested.</p></section><section><h3>2 · Work with tabs</h3><p>Right-click a tab to duplicate, disconnect, reconnect or close it. Each tab keeps its own SFTP and log drawer state.</p></section><section><h3>3 · Transfer files</h3><p>Open SFTP to drag files for upload, multi-select downloads, edit text files, inspect properties and permissions.</p></section><section><h3>4 · Inspect logs</h3><p>Choose a remote log, configure tail/follow, pause streaming and search by line number.</p></section></div><div class="help-tip"><b>Tip</b><span>Multi-line paste opens a compose pane before sending—review commands before they reach the shell.</span></div>`],
+    guide: ["User Guide", `<div class="help-hero"><span>›_</span><div><h2>Start working quickly</h2><p>Manage SSH sessions, local terminals, files and logs in one window.</p></div></div><div class="help-card-grid"><section><h3>1 · Connect</h3><p>Create an SSH session or double-click a saved session. Passwords are stored only in the system credential store when requested.</p></section><section><h3>2 · Work with tabs</h3><p>Right-click a tab to duplicate, disconnect, reconnect or close it. Each tab keeps its own SFTP and log drawer state.</p></section><section><h3>3 · Transfer files</h3><p>Open SFTP to drag files for upload, multi-select downloads, edit text files, inspect properties and permissions.</p></section><section><h3>4 · Inspect logs</h3><p>Choose a remote log, configure tail/follow, pause streaming and search by line number.</p></section></div><div class="help-tip"><b>Tip</b><span>Multi-line paste opens a compose pane before sending—review commands before they reach the shell.</span></div>`],
     shortcuts: ["Keyboard Shortcuts", `<div class="shortcut-groups"><section><h3>Sessions</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd></dt><dd>New SSH session</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd></dt><dd>Close current tab</dd><dt><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>]</kbd></dt><dd>Disconnect / close session</dd></dl></section><section><h3>Terminal</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>Copy selection</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd></dt><dd>Paste or open compose pane</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></dt><dd>Find in terminal</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>A</kbd></dt><dd>Select all terminal text</dd></dl></section><section><h3>Panels & window</h3><dl><dt><kbd>Ctrl</kbd><kbd>B</kbd></dt><dd>Toggle session manager</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>Toggle SFTP</dd><dt><kbd>F11</kbd></dt><dd>Toggle full screen</dd><dt><kbd>Esc</kbd></dt><dd>Close the active panel or dialog</dd></dl></section></div>`],
-    about: ["About Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">Version 0.1.0 · Tauri 2</p><p>A native Windows SSH, SFTP and local PowerShell workspace built with Rust and xterm.js.</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">Passwords are stored in Windows Credential Manager and are never written to session JSON.</p>`],
+    about: ["About Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">Version 0.1.0 · Tauri 2</p><p>A cross-platform SSH, SFTP and local terminal workspace built with Rust and xterm.js.</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>PTY</span><span>UTF-8</span></div><p class="muted">Passwords are stored in the system credential store and are never written to session JSON.</p>`],
   } : {
-    guide: ["使用说明", `<div class="help-hero"><span>›_</span><div><h2>快速开始工作</h2><p>在一个窗口中管理 SSH 会话、本地 PowerShell、文件与日志。</p></div></div><div class="help-card-grid"><section><h3>1 · 建立连接</h3><p>新建 SSH 会话，或双击左侧已保存会话。勾选记住密码后，仅保存到 Windows 凭据管理器。</p></section><section><h3>2 · 管理标签</h3><p>右键标签可复制同连接会话、断开、重新连接或关闭；每个标签独立保持 SFTP 与日志抽屉状态。</p></section><section><h3>3 · 传输文件</h3><p>打开 SFTP 后可拖拽上传、多选下载、预览编辑文本，并查看属性或修改权限。</p></section><section><h3>4 · 查看日志</h3><p>选择远程日志后可设置 tail/follow、暂停实时刷新，并按行搜索内容。</p></section></div><div class="help-tip"><b>提示</b><span>粘贴多行内容会先进入编辑区，确认无误后再发送到终端。</span></div>`],
+    guide: ["使用说明", `<div class="help-hero"><span>›_</span><div><h2>快速开始工作</h2><p>在一个窗口中管理 SSH 会话、本地终端、文件与日志。</p></div></div><div class="help-card-grid"><section><h3>1 · 建立连接</h3><p>新建 SSH 会话，或双击左侧已保存会话。勾选记住密码后，仅保存到系统安全凭据库。</p></section><section><h3>2 · 管理标签</h3><p>右键标签可复制同连接会话、断开、重新连接或关闭；每个标签独立保持 SFTP 与日志抽屉状态。</p></section><section><h3>3 · 传输文件</h3><p>打开 SFTP 后可拖拽上传、多选下载、预览编辑文本，并查看属性或修改权限。</p></section><section><h3>4 · 查看日志</h3><p>选择远程日志后可设置 tail/follow、暂停实时刷新，并按行搜索内容。</p></section></div><div class="help-tip"><b>提示</b><span>粘贴多行内容会先进入编辑区，确认无误后再发送到终端。</span></div>`],
     shortcuts: ["快捷键说明", `<div class="shortcut-groups"><section><h3>会话</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd></dt><dd>新建 SSH 会话</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd></dt><dd>关闭当前标签</dd><dt><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>]</kbd></dt><dd>断开或关闭当前会话</dd></dl></section><section><h3>终端</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>复制选中内容</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd></dt><dd>粘贴或打开多行编辑区</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></dt><dd>在终端中查找</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>A</kbd></dt><dd>全选终端内容</dd></dl></section><section><h3>面板与窗口</h3><dl><dt><kbd>Ctrl</kbd><kbd>B</kbd></dt><dd>展开或折叠会话管理器</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>打开或关闭 SFTP</dd><dt><kbd>F11</kbd></dt><dd>进入或退出全屏</dd><dt><kbd>Esc</kbd></dt><dd>关闭当前抽屉或弹窗</dd></dl></section></div>`],
-    about: ["关于 Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">版本 0.1.0 · Tauri 2</p><p>基于 Rust 与 xterm.js 构建的 Windows 原生 SSH、SFTP 和本地 PowerShell 工作台。</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">密码仅保存到 Windows 凭据管理器，不会写入会话 JSON。</p>`],
+    about: ["关于 Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">版本 0.1.0 · Tauri 2</p><p>基于 Rust 与 xterm.js 构建的跨平台 SSH、SFTP 和本地终端工作台。</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>PTY</span><span>UTF-8</span></div><p class="muted">密码仅保存到系统安全凭据库，不会写入会话 JSON。</p>`],
   };
   return contents[section];
 }
@@ -2108,26 +2154,29 @@ function openHelpModal(section) {
 
 async function exportSessions() {
   if (!state.sessions.length) return toast("没有可导出的会话", "error");
-  const path = await save({ defaultPath: "orbiterm-sessions.json", filters: [{ name: "Orbiterm 会话配置", extensions: ["json"] }] });
-  if (!path) return;
   try {
     const sessions = state.sessions.map((session) => ({ ...session, rememberPassword: false }));
-    await invoke("write_text_file", { path, content: JSON.stringify({ version: 1, sessions }, null, 2) });
+    const content = JSON.stringify({ format: "orbiterm-session-bundle", version: 1, sessions }, null, 2);
+    const saved = await invoke("export_session_bundle", { content });
+    if (!saved) return;
     toast(`已导出 ${state.sessions.length} 个会话`, "success");
   } catch (error) { toast(String(error), "error"); }
 }
 
 async function importSessions() {
-  const path = await open({ multiple: false, directory: false, filters: [{ name: "Orbiterm 会话配置", extensions: ["json"] }] });
-  if (!path) return;
   try {
-    const parsed = JSON.parse(await invoke("read_text_file", { path }));
-    const imported = Array.isArray(parsed) ? parsed : parsed.sessions;
+    const content = await invoke("import_session_bundle");
+    if (!content) return;
+    const parsed = JSON.parse(content);
+    const imported = parsed.sessions;
     if (!Array.isArray(imported)) throw new Error("配置文件格式无效");
-    const valid = imported.filter((session) => session && typeof session.name === "string" && typeof session.host === "string" && Number.isInteger(Number(session.port)));
+    const valid = imported.map(sanitizeImportedSession).filter(Boolean);
     if (!valid.length) throw new Error("配置中没有有效会话");
     const existing = new Set(state.sessions.map((session) => session.id));
-    valid.forEach((session) => state.sessions.push({ ...session, id: session.id && !existing.has(session.id) ? session.id : crypto.randomUUID(), fingerprint: session.fingerprint || "" }));
+    valid.forEach((session) => {
+      const id = allocateSessionId(session.id, existing, () => crypto.randomUUID());
+      state.sessions.push({ ...session, id });
+    });
     persistSessions();
     renderSessions();
     toast(`已导入 ${valid.length} 个会话`, "success");
@@ -2219,7 +2268,7 @@ async function requestAppClose() {
       el("closeWindow").disabled = false;
       return;
     }
-    await Promise.all([...state.activeTransferIds].map((transferId) => invoke("cancel_transfer", { transferId }).catch(() => {})));
+    await cancelAllTransfers();
     if (state.transferPromises.size) {
       await Promise.race([
         Promise.allSettled([...state.transferPromises.values()]),
@@ -2459,9 +2508,13 @@ document.querySelectorAll("[data-new-remote]").forEach((button) => button.addEve
   if (button.dataset.newRemote === "file") createRemoteFile(); else createFolder();
 }));
 el("cancelTransfer").addEventListener("click", async () => {
-  if (!state.activeTransferId) return;
-  await Promise.all([...state.activeTransferIds].map((transferId) => invoke("cancel_transfer", { transferId }).catch(() => {})));
-  el("transferText").textContent = "正在取消传输…";
+  if (!state.activeTransferIds.size) return;
+  await cancelAllTransfers();
+});
+el("clearTransfers").addEventListener("click", clearFinishedTransfers);
+el("transferList").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-cancel-transfer]");
+  if (button) void cancelTransferTask(button.dataset.cancelTransfer);
 });
 el("remoteFiles").addEventListener("click", (event) => {
   selectRemoteRow(event.target.closest(".remote-row"), event);
@@ -2641,22 +2694,11 @@ if (isTauri) {
   }).catch(() => {});
   listen("transfer-progress", ({ payload }) => {
     if (!state.activeTransferIds.has(payload.transferId)) return;
-    const meta = state.transferMeta.get(payload.transferId) || { prefix: "", name: "文件", startedAt: performance.now() };
+    const meta = state.transferMeta.get(payload.transferId);
+    if (!meta) return;
     meta.transferred = payload.transferred;
     meta.total = payload.total || meta.total || 0;
-    state.transferMeta.set(payload.transferId, meta);
-    state.activeTransferId = payload.transferId;
-    const active = [...state.transferMeta.values()];
-    const transferred = active.reduce((sum, item) => sum + (item.transferred || 0), 0);
-    const knownTotals = active.filter((item) => item.total > 0);
-    const total = knownTotals.reduce((sum, item) => sum + item.total, 0);
-    const allTotalsKnown = knownTotals.length === active.length && total > 0;
-    const startedAt = Math.min(...active.map((item) => item.startedAt));
-    const seconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
-    const percent = allTotalsKnown ? transferred / total * 100 : null;
-    const sizeText = total ? `${formatSize(transferred)} / ${formatSize(total)}` : formatSize(transferred);
-    const taskText = active.length > 1 ? `${active.length} 个任务` : meta.name;
-    setTransfer(`${taskText} · ${sizeText} · ${formatSize(transferred / seconds)}/s`, true, percent);
+    renderTransfers();
   }).catch(() => {});
 }
 
@@ -2668,4 +2710,5 @@ setDrawerWidth("tail", state.preferences.tailWidth);
 setDrawerWidth("manual", state.preferences.manualWidth);
 document.querySelectorAll("[data-resize-drawer]").forEach(installDrawerResize);
 updateSftpControls();
+renderTransfers();
 setSidebarCollapsed(Boolean(state.preferences.sidebarCollapsed));

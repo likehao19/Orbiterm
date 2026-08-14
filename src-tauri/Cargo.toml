@@ -17,7 +17,8 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 ssh2 = "0.9"
-keyring = { version = "3", features = ["windows-native"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 portable-pty = "0.9"
+serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

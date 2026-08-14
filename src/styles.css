@@ -163,7 +163,7 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .find-bar button { width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #64748b; cursor: pointer; }
 .find-bar button:hover { background: #eaf1fb; color: #1d4ed8; }
 
-.sftp-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; width: min(560px, calc(100% - 24px)); min-width: 0; display: grid; grid-template-rows: 52px 42px 40px 34px minmax(0, 1fr) 48px; background: #fff; border-left: 1px solid #cfd8e5; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
+.sftp-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; width: min(560px, calc(100% - 24px)); min-width: 0; display: grid; grid-template-rows: 52px 42px 40px 34px minmax(0, 1fr) auto; background: #fff; border-left: 1px solid #cfd8e5; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
 .sftp-panel.hidden { display: none; }
 .sftp-panel:not(.hidden) { animation: sftp-slide-in .18s ease-out; }
 @keyframes sftp-slide-in { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: translateX(0); } }
@@ -229,15 +229,29 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .text-icon { background: #e2e8f0; color: #475569; }
 .file-placeholder { padding: 35px 12px; text-align: center; color: #596980; font-size: 11px; line-height: 1.5; }
 .file-placeholder.error { color: #f87171; }
-.transfer-log { display: grid; grid-template-columns: 25px minmax(80px, 1fr) 105px auto; align-items: center; gap: 8px; overflow: hidden; padding: 0 11px; border-top: 1px solid #dce3ed; color: #64748b; background: #f8fafc; font-size: 10px; }
+.transfer-log { max-height: 220px; overflow: hidden; border-top: 1px solid #dce3ed; color: #64748b; background: #f8fafc; font-size: 10px; }
+.transfer-log-head { min-height: 47px; display: flex; align-items: center; gap: 8px; padding: 0 10px; }
 .transfer-icon { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 6px; background: #e8f1ff; color: #2563eb; }
-.transfer-log > span:not(.transfer-icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-log-head > span:not(.transfer-icon) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-list { max-height: 172px; overflow-y: auto; border-top: 1px solid #e2e8f0; }
+.transfer-task { min-height: 57px; display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #e8edf3; background: #fff; }
+.transfer-task:last-child { border-bottom: 0; }
+.transfer-task-direction { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 50%; background: #dbeafe; color: #2563eb; font-size: 13px; font-weight: 700; }
+.transfer-task[data-kind="上传"] .transfer-task-direction { background: #dcfce7; color: #15803d; }
+.transfer-task-main { min-width: 0; display: grid; gap: 5px; }
+.transfer-task-info { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.transfer-task-info b { min-width: 0; flex: 1; overflow: hidden; color: #334155; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
+.transfer-task-info small { flex: 0 0 auto; color: #94a3b8; font-size: 9px; }
 .transfer-progress { position: relative; height: 16px; overflow: hidden; border-radius: 8px; background: #dbe4f0; }
 .transfer-progress i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #3b82f6, #60a5fa); transition: width .12s linear; }
 .transfer-progress small { position: absolute; inset: 0; display: grid; place-items: center; color: #1e3a5f; font-size: 8px; font-weight: 600; text-shadow: 0 1px #fff8; }
 .transfer-progress.indeterminate i { width: 38% !important; animation: transfer-indeterminate 1s ease-in-out infinite; }
 @keyframes transfer-indeterminate { from { transform: translateX(-110%); } to { transform: translateX(280%); } }
-.transfer-log button { height: 24px; padding: 0 7px; border: 0; border-radius: 4px; background: #fee2e2; color: #b91c1c; cursor: pointer; font-size: 10px; }
+.transfer-log button { height: 24px; flex: 0 0 auto; padding: 0 7px; border: 0; border-radius: 4px; background: #fee2e2; color: #b91c1c; cursor: pointer; font-size: 10px; }
+.transfer-log #clearTransfers { background: #e2e8f0; color: #475569; }
+.transfer-task button { width: 24px; padding: 0; font-size: 13px; }
+.transfer-task[data-status="completed"] .transfer-progress i { background: #22c55e; }
+.transfer-task[data-status="cancelled"] .transfer-progress i, .transfer-task[data-status="error"] .transfer-progress i { background: #ef4444; }
 .sftp-context-menu, .sftp-more-menu { z-index: 70; width: 220px; }
 .drawer-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; border-left: 1px solid #cfd8e5; background: #fff; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
 .drawer-resize { position: absolute; z-index: 4; top: 0; bottom: 0; left: -4px; width: 8px; cursor: ew-resize; touch-action: none; }
@@ -645,6 +659,10 @@ details { border-color: #dce3ed; }
 :root[data-app-theme="dark"] .tail-browser > div { background: #111827; border-color: #334155; color: #dbeafe; }
 :root[data-app-theme="dark"] .new-remote-menu button:hover { background: #1e293b; color: #fff; }
 :root[data-app-theme="dark"] .transfer-log { background: #0f172a; border-color: #263449; color: #cbd5e1; }
+:root[data-app-theme="dark"] .transfer-list,
+:root[data-app-theme="dark"] .transfer-task { background: #111827; border-color: #263449; }
+:root[data-app-theme="dark"] .transfer-task-info b { color: #e2e8f0; }
+:root[data-app-theme="dark"] .transfer-progress { background: #263449; }
 :root[data-app-theme="dark"] .sftp-nav input,
 :root[data-app-theme="dark"] .sftp-filter input,
 :root[data-app-theme="dark"] .tail-browser input,
