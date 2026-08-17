@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orbiterm 文件查看器</title>
+  </head>
+  <body>
+    <main id="viewerApp" class="viewer-shell">
+      <header class="viewer-head">
+        <span><strong id="fileName">远程文件</strong><small id="filePath"></small></span>
+        <div class="viewer-actions">
+          <button id="toggleEdit">编辑</button>
+          <button id="toggleLines" class="active">行号</button>
+          <button id="openFind">查找</button>
+          <button id="toggleMaximize" title="最大化或恢复">□</button>
+          <button id="toggleFullscreen" title="全屏或退出全屏">⛶</button>
+        </div>
+      </header>
+      <section id="findBar" class="find-bar hidden">
+        <input id="findInput" placeholder="查找内容" />
+        <small id="findCount"></small>
+        <button id="findPrevious" title="上一个">↑</button>
+        <button id="findNext" title="下一个">↓</button>
+        <button id="closeFind" title="关闭">×</button>
+      </section>
+      <section class="editor-area">
+        <pre id="lineNumbers"></pre>
+        <textarea id="editor" readonly spellcheck="false" wrap="off"></textarea>
+        <div id="loading" class="loading"><i></i><span>正在读取远程文件…</span></div>
+      </section>
+      <footer>
+        <span id="encoding">—</span><span id="fileSize">—</span><span id="status">只读预览</span>
+        <button id="loadMore" class="secondary hidden">继续加载</button>
+        <button id="saveFile" disabled>保存到远端</button>
+      </footer>
+      <div id="confirmClose" class="confirm-sheet hidden"><span>文件有未保存的修改，确定放弃吗？</span><button id="keepEditing">继续编辑</button><button id="discardChanges" class="danger">放弃并关闭</button></div>
+      <div id="toast" class="viewer-toast hidden"></div>
+    </main>
+    <script type="module" src="/src/viewer.js"></script>
+  </body>
+</html>

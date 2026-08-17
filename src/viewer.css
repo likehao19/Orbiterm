@@ -1,0 +1,31 @@
+:root { font-family: Inter, "Microsoft YaHei UI", "Segoe UI", sans-serif; color: #334155; background: #fff; }
+* { box-sizing: border-box; }
+html, body, #viewerApp { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input, textarea { font: inherit; }
+.viewer-shell { position: relative; display: grid; grid-template-rows: 46px auto minmax(0, 1fr) 38px; background: #fff; }
+.viewer-head { grid-row: 1; min-width: 0; display: flex; align-items: center; gap: 16px; padding: 0 10px 0 15px; border-bottom: 1px solid #dce3ed; background: #f8fafc; }
+.viewer-head > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.viewer-head strong, .viewer-head small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.viewer-head strong { font-size: 12px; }.viewer-head small { color: #8492a6; font: 9px Consolas, monospace; }
+.viewer-actions { display: flex; align-items: center; gap: 4px; }
+.viewer-actions button, .find-bar button, footer button, .confirm-sheet button { height: 28px; padding: 0 9px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #475569; cursor: pointer; font-size: 10px; }
+.viewer-actions button:hover, .viewer-actions button.active { border-color: #7da8e3; background: #eff6ff; color: #1d4ed8; }
+.viewer-actions button:nth-last-child(-n+2) { width: 30px; padding: 0; font-size: 15px; }
+.find-bar { grid-row: 2; display: flex; align-items: center; gap: 4px; min-height: 34px; padding: 3px 10px; border-bottom: 1px solid #dce3ed; background: #fff; }
+.hidden { display: none !important; }
+.find-bar input { width: min(320px, 60vw); height: 27px; padding: 0 8px; border: 1px solid #cbd5e1; border-radius: 5px; outline: 0; font-size: 10px; }
+.find-bar input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px #3b82f61a; }.find-bar small { color: #64748b; font-size: 9px; }
+.find-bar button { width: 27px; padding: 0; }
+.editor-area { grid-row: 3; position: relative; min-width: 0; min-height: 0; overflow: hidden; background: #0f172a; }
+#editor { width: 100%; height: 100%; resize: none; padding: 14px 18px 24px 62px; border: 0; outline: 0; overflow: auto; background: #0f172a; color: #e5edf7; caret-color: #60a5fa; font: 13px/1.55 "Cascadia Code", Consolas, monospace; tab-size: 2; white-space: pre; }
+#editor[readonly] { color: #cbd5e1; caret-color: transparent; }#editor.no-lines { padding-left: 18px; }
+#lineNumbers { position: absolute; z-index: 1; inset: 0 auto 0 0; width: 48px; margin: 0; overflow: hidden; padding: 14px 8px 24px 0; border-right: 1px solid #263247; background: #111827; color: #64748b; font: 13px/1.55 "Cascadia Code", Consolas, monospace; text-align: right; user-select: none; }
+.loading { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 10px; background: #0f172a; color: #94a3b8; font-size: 10px; }
+.loading i { width: 27px; height: 27px; border: 2px solid #334155; border-top-color: #60a5fa; border-radius: 50%; animation: spin .7s linear infinite; }@keyframes spin { to { transform: rotate(360deg); } }
+footer { grid-row: 4; display: flex; align-items: center; gap: 15px; padding: 0 10px 0 15px; border-top: 1px solid #dce3ed; background: #f8fafc; color: #64748b; font-size: 9px; }
+footer #status { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+footer button { border-color: #2563eb; background: #2563eb; color: #fff; }footer button:disabled { border-color: #cbd5e1; background: #e2e8f0; color: #94a3b8; cursor: default; }
+footer button.secondary { border-color: #cbd5e1; background: #fff; color: #475569; }
+.confirm-sheet { position: absolute; z-index: 5; right: 12px; bottom: 47px; display: flex; align-items: center; gap: 7px; padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 7px; background: #fff; box-shadow: 0 12px 35px #0f172a30; font-size: 10px; }.confirm-sheet .danger { border-color: #fecaca; color: #b91c1c; }
+.viewer-toast { position: absolute; z-index: 6; left: 50%; bottom: 48px; max-width: 70%; transform: translateX(-50%); padding: 7px 11px; border-radius: 6px; background: #172033; color: #fff; box-shadow: 0 8px 25px #0005; font-size: 10px; }
+:root[data-theme="dark"] { color-scheme: dark; background: #0b1220; }:root[data-theme="dark"] .viewer-shell,:root[data-theme="dark"] .viewer-head,:root[data-theme="dark"] .find-bar,:root[data-theme="dark"] footer { background: #111827; border-color: #263449; color: #e5e7eb; }:root[data-theme="dark"] button,:root[data-theme="dark"] input,:root[data-theme="dark"] .confirm-sheet { border-color: #334155; background: #172033; color: #e5e7eb; }

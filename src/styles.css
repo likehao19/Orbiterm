@@ -163,7 +163,7 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .find-bar button { width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #64748b; cursor: pointer; }
 .find-bar button:hover { background: #eaf1fb; color: #1d4ed8; }
 
-.sftp-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; width: min(560px, calc(100% - 24px)); min-width: 0; display: grid; grid-template-rows: 52px 42px 40px 34px minmax(0, 1fr) auto; background: #fff; border-left: 1px solid #cfd8e5; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
+.sftp-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; width: min(560px, calc(100% - 24px)); min-width: 0; display: grid; grid-template-rows: 52px 42px 40px 34px minmax(0, 1fr) auto 48px; background: #fff; border-left: 1px solid #cfd8e5; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
 .sftp-panel.hidden { display: none; }
 .sftp-panel:not(.hidden) { animation: sftp-slide-in .18s ease-out; }
 @keyframes sftp-slide-in { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: translateX(0); } }
@@ -214,6 +214,8 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .remote-row:hover { background: #f0f6ff; }
 .remote-row:focus-visible { outline: 2px solid #3b82f6; outline-offset: -2px; }
 .remote-row.selected { background: #e4efff; border-color: #a9c8f3; color: #1e3a5f; }
+.remote-load-more { width: calc(100% - 8px); height: 30px; margin: 5px 4px 1px; border: 1px solid #cbd5e1; border-radius: 5px; background: #f8fafc; color: #475569; cursor: pointer; font-size: 10px; }
+.remote-load-more:hover { border-color: #93b9ee; background: #edf4ff; color: #1d4ed8; }
 .remote-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-row span:first-child { display: flex; align-items: center; gap: 9px; color: #334155; font-size: 11px; }
 .remote-row b { overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
@@ -229,34 +231,39 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .text-icon { background: #e2e8f0; color: #475569; }
 .file-placeholder { padding: 35px 12px; text-align: center; color: #596980; font-size: 11px; line-height: 1.5; }
 .file-placeholder.error { color: #f87171; }
-.transfer-log { max-height: 220px; overflow: hidden; border-top: 1px solid #dce3ed; color: #64748b; background: #f8fafc; font-size: 10px; }
-.transfer-log-head { min-height: 47px; display: flex; align-items: center; gap: 8px; padding: 0 10px; }
+.transfer-tasks { max-height: 190px; min-height: 84px; display: grid; grid-template-rows: 31px minmax(0, 1fr); border-top: 1px solid #dce3ed; background: #fff; }
+.transfer-tasks > header { display: flex; align-items: center; gap: 7px; padding: 0 10px; border-bottom: 1px solid #e8edf3; color: #334155; font-size: 10px; }
+.transfer-tasks > header small { color: #94a3b8; }
+.transfer-tasks > header button { margin-left: auto; padding: 2px 6px; border: 0; border-radius: 4px; background: transparent; color: #64748b; cursor: pointer; font-size: 9px; }
+.transfer-tasks > header button:hover { background: #eef4fb; color: #2563eb; }
+.transfer-task-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 3px 6px 5px; scrollbar-gutter: stable; }
+.transfer-task { display: grid; grid-template-columns: 24px minmax(0, 1fr) 72px 24px; align-items: center; gap: 6px; min-height: 35px; padding: 3px 5px; border-radius: 5px; color: #64748b; font-size: 9px; }
+.transfer-task:hover { background: #f5f8fc; }
+.transfer-task > i { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 5px; background: #e8f1ff; color: #2563eb; font-style: normal; }
+.transfer-task > span { min-width: 0; display: flex; flex-direction: column; }
+.transfer-task b, .transfer-task small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-task b { color: #334155; font-size: 10px; font-weight: 500; }
+.transfer-task small { color: #94a3b8; }
+.transfer-task progress { width: 72px; height: 6px; border: 0; accent-color: #3b82f6; }
+.transfer-task > button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #94a3b8; cursor: pointer; font-size: 13px; }
+.transfer-task > button:hover { background: #fee2e2; color: #b91c1c; }
+.transfer-task[data-status="completed"] > i { background: #dcfce7; color: #15803d; }
+.transfer-task[data-status="error"] > i { background: #fee2e2; color: #b91c1c; }
+.transfer-task[data-status="cancelled"] > i { background: #f1f5f9; color: #64748b; }
+.transfer-log { display: grid; grid-template-columns: 25px minmax(80px, 1fr) 105px auto; align-items: center; gap: 8px; overflow: hidden; padding: 0 11px; border-top: 1px solid #dce3ed; color: #64748b; background: #f8fafc; font-size: 10px; }
 .transfer-icon { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 6px; background: #e8f1ff; color: #2563eb; }
-.transfer-log-head > span:not(.transfer-icon) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transfer-list { max-height: 172px; overflow-y: auto; border-top: 1px solid #e2e8f0; }
-.transfer-task { min-height: 57px; display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #e8edf3; background: #fff; }
-.transfer-task:last-child { border-bottom: 0; }
-.transfer-task-direction { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 50%; background: #dbeafe; color: #2563eb; font-size: 13px; font-weight: 700; }
-.transfer-task[data-kind="上传"] .transfer-task-direction { background: #dcfce7; color: #15803d; }
-.transfer-task-main { min-width: 0; display: grid; gap: 5px; }
-.transfer-task-info { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
-.transfer-task-info b { min-width: 0; flex: 1; overflow: hidden; color: #334155; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
-.transfer-task-info small { flex: 0 0 auto; color: #94a3b8; font-size: 9px; }
+.transfer-log > span:not(.transfer-icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .transfer-progress { position: relative; height: 16px; overflow: hidden; border-radius: 8px; background: #dbe4f0; }
 .transfer-progress i { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #3b82f6, #60a5fa); transition: width .12s linear; }
 .transfer-progress small { position: absolute; inset: 0; display: grid; place-items: center; color: #1e3a5f; font-size: 8px; font-weight: 600; text-shadow: 0 1px #fff8; }
 .transfer-progress.indeterminate i { width: 38% !important; animation: transfer-indeterminate 1s ease-in-out infinite; }
 @keyframes transfer-indeterminate { from { transform: translateX(-110%); } to { transform: translateX(280%); } }
-.transfer-log button { height: 24px; flex: 0 0 auto; padding: 0 7px; border: 0; border-radius: 4px; background: #fee2e2; color: #b91c1c; cursor: pointer; font-size: 10px; }
-.transfer-log #clearTransfers { background: #e2e8f0; color: #475569; }
-.transfer-task button { width: 24px; padding: 0; font-size: 13px; }
-.transfer-task[data-status="completed"] .transfer-progress i { background: #22c55e; }
-.transfer-task[data-status="cancelled"] .transfer-progress i, .transfer-task[data-status="error"] .transfer-progress i { background: #ef4444; }
+.transfer-log button { height: 24px; padding: 0 7px; border: 0; border-radius: 4px; background: #fee2e2; color: #b91c1c; cursor: pointer; font-size: 10px; }
 .sftp-context-menu, .sftp-more-menu { z-index: 70; width: 220px; }
 .drawer-panel { position: absolute; z-index: 9; top: 36px; right: 0; bottom: 0; border-left: 1px solid #cfd8e5; background: #fff; box-shadow: -18px 0 45px #0f172a22; color: #334155; }
 .drawer-resize { position: absolute; z-index: 4; top: 0; bottom: 0; left: -4px; width: 8px; cursor: ew-resize; touch-action: none; }
 .drawer-resize:hover { background: linear-gradient(90deg, transparent 3px, #3b82f6 3px 5px, transparent 5px); }
-.tail-panel { min-height: 0; display: grid; grid-template-rows: 38px 36px 38px 36px minmax(0, 1fr); width: min(620px, calc(100% - 24px)); }
+.tail-panel { min-height: 0; display: grid; grid-template-rows: 38px 36px auto 36px minmax(0, 1fr); width: min(620px, calc(100% - 24px)); }
 .tail-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 0 11px; border-bottom: 1px solid #dce3ed; }
 .tail-head span { display: flex; flex-direction: column; gap: 2px; }
 .tail-head strong { color: #334155; font-size: 12px; }
@@ -274,21 +281,22 @@ button.large { border-radius: 6px; padding: 8px 16px; cursor: pointer; }
 .tail-files button .file-icon { transform: scale(.82); transform-origin: center; }
 .tail-files b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 500; }
 .tail-files small { color: #94a3b8; font-size: 9px; }
-.tail-config { display: grid; grid-template-columns: 76px 68px auto 45px 45px; align-items: center; gap: 4px; padding: 4px 7px; border-bottom: 1px solid #e2e8f0; }
+.tail-config { display: grid; grid-template-columns: 94px 70px auto 45px 45px; align-items: center; gap: 4px; padding: 4px 7px; border-bottom: 1px solid #e2e8f0; }
 .tail-config select, .tail-config input { min-width: 0; height: 30px; border: 1px solid #d5dde8; border-radius: 5px; background: #fff; color: #334155; font-size: 10px; }
 .tail-config label { display: flex; align-items: center; gap: 4px; color: #64748b; font-size: 9px; white-space: nowrap; }
 .tail-config button { min-width: 0; height: 27px; padding: 0 7px; border-radius: 4px; font-size: 10px; }
+.tail-mode-hint { grid-column: 1 / -1; min-width: 0; padding: 1px 2px 2px; overflow: hidden; color: #64748b; font-size: 9px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
 .tail-search { min-width: 0; display: flex; align-items: center; gap: 3px; padding: 3px 7px; border-bottom: 1px solid #263247; background: #111827; }
 .tail-search > span { min-width: 0; flex: 1; overflow: hidden; color: #64748b; font: 9px Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .tail-search input { width: 135px; height: 25px; padding: 0 6px; border: 1px solid #334155; border-radius: 4px; outline: 0; background: #0f172a; color: #dbe5f3; font-size: 10px; }
 .tail-search button { width: 24px; height: 24px; padding: 0; border: 0; border-radius: 3px; background: #1e293b; color: #94a3b8; }
 .tail-search small { min-width: 32px; color: #64748b; font-size: 9px; text-align: right; }
 .tail-output { min-width: 0; min-height: 0; width: 100%; height: 100%; margin: 0; overflow-x: hidden; overflow-y: auto; background: #0f172a; color: #cbd5e1; font: 13px/1.58 "Cascadia Code", Consolas, monospace; }
-.tail-output > div[data-tail-line] { min-width: 0; display: grid; grid-template-columns: 52px minmax(0,1fr); }
+.tail-output > div[data-tail-line] { min-width: 100%; width: max-content; display: grid; grid-template-columns: 52px max-content; }
 .tail-output > div[data-tail-line] > span { padding-right: 9px; background: #111827; color: #475569; text-align: right; user-select: none; }
 .tail-output code { min-width: 0; padding: 0 10px; color: inherit; white-space: pre; }
 .tail-output { overflow-x: auto; }
-.tail-output::-webkit-scrollbar:horizontal { display: none; }
+.tail-output .tail-spacer { width: 1px; pointer-events: none; }
 .tail-output .match { background: #854d0e88; color: #fef3c7; }
 .tail-empty { padding: 40px; color: #64748b; text-align: center; }
 
@@ -373,9 +381,15 @@ details summary { cursor: pointer; margin-bottom: 10px; }
 .dialog-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 0 20px; border-top: 1px solid var(--border); background: #111827; }
 .dialog-foot button { height: 32px; min-width: 78px; padding: 0 13px; border: 1px solid #334155; border-radius: 5px; background: #1b2639; cursor: pointer; font-size: 11px; }
 .dialog-foot button.primary { background: #2563eb; border-color: #3b82f6; }
-.settings-dialog { width: min(440px, 95vw); }
+.settings-dialog { width: min(680px, 95vw); height: min(820px, 92vh); }
 .settings-section + .settings-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .settings-section h3 { margin: 0 0 11px; color: #334155; font-size: 11px; }
+.performance-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.performance-settings-grid .field { margin-bottom: 11px; }
+.performance-settings-grid .field small { color: #94a3b8; font-size: 9px; line-height: 1.35; }
+.setting-number-unit { display: flex; align-items: center; }
+.setting-number-unit input { border-radius: 5px 0 0 5px; }
+.setting-number-unit span { height: 34px; min-width: 42px; display: grid; place-items: center; padding: 0 8px; border: 1px solid #2c3a51; border-left: 0; border-radius: 0 5px 5px 0; background: #1d293d; color: #8998ad; font-size: 10px; }
 .help-dialog { width: min(760px, 95vw); height: min(680px, 90vh); grid-template-rows: 54px minmax(0, 1fr) 48px; }
 .help-dialog.help-guide { width: min(680px, 94vw); height: auto; max-height: 86vh; grid-template-rows: 54px auto 48px; }
 .help-dialog.help-shortcuts { width: min(620px, 94vw); height: auto; max-height: 86vh; grid-template-rows: 54px auto 48px; }
@@ -471,6 +485,7 @@ details summary { cursor: pointer; margin-bottom: 10px; }
 }
 
 @media (max-width: 620px) {
+  .performance-settings-grid { grid-template-columns: 1fr; }
   .sftp-panel { max-width: calc(100% - 12px); }
   .file-header, .remote-row { grid-template-columns: minmax(140px, 1fr) 68px 54px; }
   .file-header button:nth-child(3), .remote-row span:nth-child(3) { display: none; }
@@ -659,10 +674,15 @@ details { border-color: #dce3ed; }
 :root[data-app-theme="dark"] .tail-browser > div { background: #111827; border-color: #334155; color: #dbeafe; }
 :root[data-app-theme="dark"] .new-remote-menu button:hover { background: #1e293b; color: #fff; }
 :root[data-app-theme="dark"] .transfer-log { background: #0f172a; border-color: #263449; color: #cbd5e1; }
-:root[data-app-theme="dark"] .transfer-list,
-:root[data-app-theme="dark"] .transfer-task { background: #111827; border-color: #263449; }
-:root[data-app-theme="dark"] .transfer-task-info b { color: #e2e8f0; }
-:root[data-app-theme="dark"] .transfer-progress { background: #263449; }
+:root[data-app-theme="dark"] .transfer-tasks { background: #111827; border-color: #263449; }
+:root[data-app-theme="dark"] .transfer-tasks > header { border-color: #263449; color: #f1f5f9; }
+:root[data-app-theme="dark"] .transfer-tasks > header button { color: #cbd5e1; }
+:root[data-app-theme="dark"] .transfer-tasks > header button:hover,
+:root[data-app-theme="dark"] .transfer-task:hover { background: #1e293b; }
+:root[data-app-theme="dark"] .transfer-task b { color: #f1f5f9; }
+:root[data-app-theme="dark"] .transfer-task small,
+:root[data-app-theme="dark"] .tail-mode-hint { color: #cbd5e1; }
+:root[data-app-theme="dark"] .remote-load-more { border-color: #334155; background: #172033; color: #e2e8f0; }
 :root[data-app-theme="dark"] .sftp-nav input,
 :root[data-app-theme="dark"] .sftp-filter input,
 :root[data-app-theme="dark"] .tail-browser input,
@@ -700,6 +720,8 @@ details { border-color: #dce3ed; }
 :root[data-app-theme="dark"] .field input,
 :root[data-app-theme="dark"] .field select,
 :root[data-app-theme="dark"] .dialog-foot button { background: #172033; border-color: #334155; color: #dbe5f3; }
+:root[data-app-theme="dark"] .setting-number-unit span { background: #1e293b; border-color: #334155; color: #cbd5e1; }
+:root[data-app-theme="dark"] .performance-settings-grid .field small { color: #94a3b8; }
 :root[data-app-theme="dark"] .help-modal-body,
 :root[data-app-theme="dark"] .help-card-grid section { background: #111827; color: #cbd5e1; }
 :root[data-app-theme="dark"] .help-content h2 { color: #f1f5f9; }

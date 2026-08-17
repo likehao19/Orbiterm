@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Orbiterm —— 基于 Tauri 2、Rust、xterm.js 与 libssh2 的 SSH / SFTP 桌面终端客户端。" />
+  <title>Orbiterm · SSH / SFTP 终端</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='46' font-family='Consolas,monospace' font-size='40' font-weight='700' fill='white' text-anchor='middle'%3E%E2%80%BA_%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- 导航 -->
+  <header class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#top">
+        <span class="brand-mark">›_</span>
+        <span class="brand-text">Orbiterm</span>
+      </a>
+      <nav class="nav-links" aria-label="主导航">
+        <a href="#features">功能</a>
+        <a href="#terminal">终端</a>
+        <a href="#sftp">文件管理</a>
+        <a href="#security">安全</a>
+        <a href="#build">构建</a>
+      </nav>
+      <div class="nav-cta">
+        <a class="btn btn-primary btn-sm" href="#build">下载</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <span class="pill">Windows 桌面应用 · v0.1.0</span>
+          <h1>SSH 与 SFTP,<br />在一个终端里。</h1>
+          <p class="lead">
+            Orbiterm 是基于 Tauri 2 与 Rust 构建的 SSH / SFTP 桌面客户端。
+            交互式远程终端与文件传输走独立连接,互不阻塞;密码与私钥口令从不写入磁盘。
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#build">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+              下载 Windows 版本
+            </a>
+            <a class="btn btn-ghost" href="#features">查看功能</a>
+          </div>
+          <ul class="hero-points">
+            <li>密码 / 私钥 / SSH Agent</li>
+            <li>独立 SFTP 面板</li>
+            <li>主机指纹校验</li>
+            <li>离线命令手册</li>
+          </ul>
+        </div>
+
+        <!-- 终端演示 -->
+        <div class="hero-visual">
+          <div class="app-window">
+            <div class="app-titlebar">
+              <div class="app-brand"><span class="brand-mark sm">›_</span><strong>Orbiterm</strong><span>远程终端</span></div>
+              <div class="window-actions"><span></span><span></span><span class="close"></span></div>
+            </div>
+            <div class="app-body">
+              <aside class="app-sidebar">
+                <div class="side-title">会话管理器</div>
+                <div class="side-search">⌕ 搜索会话</div>
+                <div class="side-group">
+                  <div class="group-head">生产环境 <em>2</em></div>
+                  <div class="side-item active"><span class="server-ico">▣</span><span><b>prod-web-01</b><i>root@10.0.0.12</i></span></div>
+                  <div class="side-item"><span class="server-ico">▣</span><span><b>db-master</b><i>admin@10.0.0.30</i></span></div>
+                </div>
+                <div class="side-group">
+                  <div class="group-head">开发环境 <em>1</em></div>
+                  <div class="side-item"><span class="server-ico">▣</span><span><b>staging</b><i>deploy@staging</i></span></div>
+                </div>
+              </aside>
+              <div class="app-main">
+                <div class="app-tabs">
+                  <span class="tab active"><i class="dot ok"></i>prod-web-01<small>10.0.0.12</small><b>×</b></span>
+                  <span class="tab"><i class="dot"></i>db-master<small>10.0.0.30</small><b>×</b></span>
+                </div>
+                <div class="terminal">
+<pre><span class="ln"><span class="c-dim">root@prod-web-01:~</span>$ <span class="c-cmd">uptime</span></span>
+<span class="ln c-out"> 14:32:11 up 128 days, 3:41, load average: 0.08, 0.12, 0.10</span>
+<span class="ln"><span class="c-dim">root@prod-web-01:~</span>$ <span class="c-cmd">docker ps</span></span>
+<span class="ln c-out">CONTAINER ID   IMAGE         STATUS</span>
+<span class="ln c-out">a1b2c3d4e5f6   nginx         Up 12 days</span>
+<span class="ln c-out">f7g8h9i0j1k2   api-service   Up 12 days</span>
+<span class="ln"><span class="c-dim">root@prod-web-01:~</span>$ <span class="c-cmd">tail -f /var/log/nginx/access.log</span></span>
+<span class="ln c-dim">192.168.1.8 - - [16/Aug/2026:14:32:11] "GET /api/health 200 0.4ms"</span><span class="c-cursor">█</span></pre>
+                </div>
+                <div class="app-status">
+                  <span><i class="dot ok"></i>已连接</span>
+                  <span>root@10.0.0.12:22</span>
+                  <span class="spacer"></span>
+                  <span>日志:关闭</span><span>延迟:12 ms</span><span>UTF-8</span><span>120 × 30</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 特性 -->
+    <section class="section" id="features">
+      <div class="section-head">
+        <h2>功能</h2>
+        <p class="sub">围绕 SSH 会话与文件传输展开,不夹带多余的东西。</p>
+      </div>
+      <div class="card-grid">
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          </div>
+          <h3>三种认证方式</h3>
+          <p>密码、OpenSSH 私钥与 SSH Agent。密码与私钥口令只在当前连接中使用,不持久化。</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg>
+          </div>
+          <h3>交互式终端</h3>
+          <p>真实 PTY,多标签切换,自动适配窗口尺寸,兼容 vim、tmux 等全屏程序。</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17V7m0 0-3 3m3-3 3 3"/><path d="M17 7v10m0 0-3-3m3 3 3-3"/></svg>
+          </div>
+          <h3>独立 SFTP 面板</h3>
+          <p>悬浮文件面板使用独立连接,传输文件时终端输入输出不受影响。</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v6c0 4 3 7 7 9 4-2 7-5 7-9V6l-7-3Z"/><path d="m9.5 12 1.8 1.8 3.2-3.6"/></svg>
+          </div>
+          <h3>主机指纹校验</h3>
+          <p>首次连接确认并本地保存主机指纹,指纹发生变化时阻止连接并告警。</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>
+          </div>
+          <h3>传输进度与原子替换</h3>
+          <p>实时进度与速度显示,可随时取消。临时文件完成后原子替换,失败或取消不污染目标文件。</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v18H6a2 2 0 0 0-2 2V5Z"/><path d="M4 19a2 2 0 0 1 2-2h13"/></svg>
+          </div>
+          <h3>离线命令手册</h3>
+          <p>内置常用 Linux 命令与参数说明,无需联网即可查阅。</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- 终端 -->
+    <section class="section section-alt" id="terminal">
+      <div class="split">
+        <div class="split-copy">
+          <h2>终端</h2>
+          <p class="sub">后台非阻塞读写,保持击键即时响应,断线状态可识别。</p>
+          <ul class="check-list">
+            <li>多终端标签、自适应尺寸,断线与退出码识别</li>
+            <li>SSH keepalive 与后台非阻塞 I/O</li>
+            <li>兼容 vim 的 bracketed paste,多行粘贴安全确认</li>
+            <li>终端内容查找、浅色 / 深色主题、字体大小设置</li>
+            <li>复制、粘贴、清屏、重连与常用快捷键</li>
+            <li>可选会话日志记录,支持本地 PowerShell</li>
+          </ul>
+        </div>
+        <div class="split-card">
+          <div class="mini-titlebar"><span></span><span></span><span></span><b>vim nginx.conf</b></div>
+<pre class="mini-term">  1 server {
+  2     listen 80;
+  3     server_name example.com;
+  4     <span class="c-hl">proxy_pass http://backend;</span>
+  5 }
+~
+~
+~                                                        <span class="c-info">-- INSERT --</span></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- SFTP -->
+    <section class="section" id="sftp">
+      <div class="split reverse">
+        <div class="split-copy">
+          <h2>文件管理</h2>
+          <p class="sub">悬浮面板可调宽度,独立 SFTP 连接与终端并行工作。</p>
+          <ul class="check-list">
+            <li>目录浏览、上传、下载、新建目录、删除与重命名</li>
+            <li>记忆会话目录,支持权限修改与属性查看</li>
+            <li>同名文件覆盖确认,传输期间防止重复操作</li>
+            <li>SFTP 请求防串会话</li>
+            <li>实时进度与速度、取消与原子替换</li>
+          </ul>
+        </div>
+        <div class="split-card sftp-card">
+          <div class="sftp-head">
+            <span class="sftp-ico">⇅</span>
+            <span><b>远程文件</b><i>root@10.0.0.12</i></span>
+            <em>×</em>
+          </div>
+          <div class="sftp-toolbar">
+            <span class="accent">↑ 上传</span><span>↓ 下载</span><span>＋ 新建</span><span class="grow">⌕ 筛选当前目录</span><small>12 项</small>
+          </div>
+          <div class="file-list">
+            <div class="file-row head"><span>名称</span><span>大小</span><span>修改时间</span></div>
+            <div class="file-row"><span class="folder">▸ var/</span><span>—</span><span>08-12</span></div>
+            <div class="file-row"><span class="folder">▸ etc/</span><span>—</span><span>08-12</span></div>
+            <div class="file-row"><span>nginx.conf</span><span>1.2 KB</span><span>08-11</span></div>
+            <div class="file-row"><span>app.log</span><span>48 KB</span><span>08-15</span></div>
+            <div class="file-row"><span>deploy.sh</span><span>3.8 KB</span><span>08-09</span></div>
+          </div>
+          <div class="sftp-progress"><span>⇅</span><span>上传 app.log…</span><div class="bar"><i style="width:68%"></i></div><small>68%</small></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 安全 -->
+    <section class="section section-alt" id="security">
+      <div class="section-head">
+        <h2>安全</h2>
+        <p class="sub">凭据不落盘,操作显式触发。</p>
+      </div>
+      <div class="security-grid">
+        <div class="security-item">
+          <span class="s-num">01</span>
+          <h3>主机指纹校验</h3>
+          <p>首次连接确认服务器主机指纹并本地保存;后续指纹发生变化时阻止连接并告警。</p>
+        </div>
+        <div class="security-item">
+          <span class="s-num">02</span>
+          <h3>凭据不持久化</h3>
+          <p>密码与私钥口令只在本次连接中传给 Rust 后端,不写入磁盘;会话参数仅保存在本地 WebView 存储。</p>
+        </div>
+        <div class="security-item">
+          <span class="s-num">03</span>
+          <h3>原子替换</h3>
+          <p>上传、下载与删除均由用户显式触发;传输失败或取消通过临时文件与原子替换,保证目标文件不被污染。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 技术栈 -->
+    <section class="section section-stack" id="stack">
+      <div class="stack-row">
+        <span class="stack-label">技术栈</span>
+        <div class="stack-grid">
+          <div class="stack-item"><b>Tauri 2</b><small>桌面框架</small></div>
+          <div class="stack-item"><b>Rust</b><small>后端与 I/O</small></div>
+          <div class="stack-item"><b>xterm.js</b><small>终端渲染</small></div>
+          <div class="stack-item"><b>libssh2</b><small>SSH / SFTP</small></div>
+          <div class="stack-item"><b>Vite</b><small>前端构建</small></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 构建 -->
+    <section class="section" id="build">
+      <div class="build-box">
+        <h2>构建与运行</h2>
+        <p class="sub">克隆仓库后,在本地构建。</p>
+        <div class="code-block">
+          <div class="code-title"><span>PowerShell</span></div>
+<pre><code><span class="c-cmd">npm install</span>
+<span class="c-cmd">npm run tauri dev</span>
+
+<span class="c-comment"># 仅构建可执行文件</span>
+<span class="c-cmd">npm run tauri -- build --debug --no-bundle</span>
+
+<span class="c-comment"># 构建安装包</span>
+<span class="c-cmd">npm run tauri build</span></code></pre>
+        </div>
+        <div class="build-actions">
+          <a class="btn btn-primary" href="#top">下载 Windows 版本</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="footer-brand"><span class="brand-mark sm">›_</span><span>Orbiterm</span></div>
+      <p>基于 Tauri 2 · Rust · xterm.js · libssh2 的 SSH / SFTP 桌面客户端。</p>
+      <p class="footer-meta">© 2026 Orbiterm contributors · v0.1.0</p>
+    </div>
+  </footer>
+
+</body>
+</html>
