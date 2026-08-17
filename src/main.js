@@ -6,6 +6,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { appendTextLines, isTransientSftpError, normalizeImportedSessions } from "./runtime-utils.js";
+import { duplicateBaseNames, isPreviewableTextFile, isRetryableSftpCommand } from "./core.js";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
@@ -16,7 +17,7 @@ const decoder = new TextDecoder();
 const DEFAULT_PREFERENCES = {
   fontSize: 14, terminalTheme: "dark", appTheme: "light", language: "zh-CN",
   sftpWidth: 540, tailWidth: 620, manualWidth: 760, confirmMultiLinePaste: true,
-  uploadWorkers: 3, downloadWorkers: 6, tailMaxLines: 200_000, tailAllLimitMb: 64,
+  uploadWorkers: 3, downloadWorkers: 4, tailMaxLines: 200_000, tailAllLimitMb: 64,
   fileChunkSizeMb: 4, fileEditLimitMb: 32, sftpPageSize: 500, sftpFilterDebounceMs: 120,
 };
 let commandOptions = {};
@@ -59,6 +60,7 @@ const state = {
   uploadBatchTail: Promise.resolve(),
   downloadBatchTail: Promise.resolve(),
   transferPrefix: "",
+  transferRenderFrame: null,
   closing: false,
   remotePaths: new Map(),
   remoteEntriesByTerminal: new Map(),
@@ -289,10 +291,10 @@ document.querySelector("#app").innerHTML = `
         <div class="settings-section"><h3 id="appearanceSettingsTitle">界面</h3><div class="field full"><label id="appThemeLabel" for="appThemeSetting">软件主题</label><select id="appThemeSetting"><option value="light">浅色</option><option value="dark">深色</option></select></div><div class="field full"><label id="languageSettingLabel" for="languageSetting">界面语言</label><select id="languageSetting"><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></div></div>
         <div class="settings-section"><h3 id="terminalSettingsTitle">终端</h3><div class="field full"><label id="terminalThemeLabel" for="terminalThemeSetting">终端主题</label><select id="terminalThemeSetting"><option value="light">浅色终端</option><option value="dark">深色终端</option></select></div><div class="field full"><label id="fontSizeLabel" for="fontSizeSetting">字体大小</label><input id="fontSizeSetting" type="number" min="10" max="24" /></div><label id="confirmPasteLabel" class="save-session"><input id="confirmPasteSetting" type="checkbox" /> <span>粘贴多行文本前确认</span></label></div>
         <div class="settings-section"><h3 id="performanceSettingsTitle">性能与容量</h3><div class="performance-settings-grid">
-          <div class="field"><label id="uploadWorkersLabel" for="uploadWorkersSetting">上传并发数</label><input id="uploadWorkersSetting" type="number" min="1" max="20" /><small>默认 3，新上传任务立即使用</small></div>
-          <div class="field"><label id="downloadWorkersLabel" for="downloadWorkersSetting">下载并发数</label><input id="downloadWorkersSetting" type="number" min="1" max="32" /><small>默认 6，新下载任务立即使用</small></div>
-          <div class="field"><label id="tailMaxLinesLabel" for="tailMaxLinesSetting">Tail 最大保留行数</label><input id="tailMaxLinesSetting" type="number" min="1000" max="1000000" step="1000" /><small>默认 200,000 行</small></div>
-          <div class="field"><label id="tailAllLimitLabel" for="tailAllLimitSetting">Tail 全部内容上限</label><div class="setting-number-unit"><input id="tailAllLimitSetting" type="number" min="1" max="1024" /><span>MB</span></div><small>默认 64 MB</small></div>
+          <div class="field"><label id="uploadWorkersLabel" for="uploadWorkersSetting">上传并发数</label><input id="uploadWorkersSetting" type="number" min="1" max="4" /><small>默认 3，单方向最多 4 个连接</small></div>
+          <div class="field"><label id="downloadWorkersLabel" for="downloadWorkersSetting">下载并发数</label><input id="downloadWorkersSetting" type="number" min="1" max="4" /><small>默认 4，单方向最多 4 个连接</small></div>
+          <div class="field"><label id="tailMaxLinesLabel" for="tailMaxLinesSetting">Tail 最大保留行数</label><input id="tailMaxLinesSetting" type="number" min="1000" max="300000" step="1000" /><small>默认 200,000 行</small></div>
+          <div class="field"><label id="tailAllLimitLabel" for="tailAllLimitSetting">Tail 全部内容上限</label><div class="setting-number-unit"><input id="tailAllLimitSetting" type="number" min="1" max="256" /><span>MB</span></div><small>默认 64 MB</small></div>
           <div class="field"><label id="fileChunkSizeLabel" for="fileChunkSizeSetting">文件分块大小</label><div class="setting-number-unit"><input id="fileChunkSizeSetting" type="number" min="1" max="64" /><span>MB</span></div><small>默认每次读取 4 MB</small></div>
           <div class="field"><label id="fileEditLimitLabel" for="fileEditLimitSetting">文件可编辑上限</label><div class="setting-number-unit"><input id="fileEditLimitSetting" type="number" min="1" max="1024" /><span>MB</span></div><small>默认 32 MB</small></div>
           <div class="field"><label id="sftpPageSizeLabel" for="sftpPageSizeSetting">SFTP 每批显示项数</label><input id="sftpPageSizeSetting" type="number" min="100" max="5000" step="100" /><small>默认 500 项</small></div>
@@ -346,12 +348,12 @@ function normalizePreferences(preferences = {}) {
   return {
     ...merged,
     fontSize: boundedNumber(merged.fontSize, 14, 10, 24),
-    uploadWorkers: boundedNumber(merged.uploadWorkers, 3, 1, 20),
-    downloadWorkers: boundedNumber(merged.downloadWorkers, 6, 1, 32),
-    tailMaxLines: boundedNumber(merged.tailMaxLines, 200_000, 1_000, 1_000_000),
-    tailAllLimitMb: boundedNumber(merged.tailAllLimitMb, 64, 1, 1_024),
+    uploadWorkers: boundedNumber(merged.uploadWorkers, 3, 1, 4),
+    downloadWorkers: boundedNumber(merged.downloadWorkers, 4, 1, 4),
+    tailMaxLines: boundedNumber(merged.tailMaxLines, 200_000, 1_000, 300_000),
+    tailAllLimitMb: boundedNumber(merged.tailAllLimitMb, 64, 1, 256),
     fileChunkSizeMb: boundedNumber(merged.fileChunkSizeMb, 4, 1, 64),
-    fileEditLimitMb: boundedNumber(merged.fileEditLimitMb, 32, 1, 1_024),
+    fileEditLimitMb: boundedNumber(merged.fileEditLimitMb, 32, 1, 64),
     sftpPageSize: boundedNumber(merged.sftpPageSize, 500, 100, 5_000),
     sftpFilterDebounceMs: boundedNumber(merged.sftpFilterDebounceMs, 120, 0, 2_000),
   };
@@ -1058,7 +1060,7 @@ function createTerminalView(session) {
   });
   terminal.writeln(session.local ? "正在启动本地 PowerShell…" : `Connecting to ${session.host}:${session.port}...`);
 
-  const record = { id, session, terminal, fit, fitObserver, search, host, connected: false, stopped: false, logging: false, logPath: "", latency: null, writeChain: Promise.resolve(), resizeTimer: null, inputTimer: null, inputQueue: [], inputBytes: 0, cwdSyncTimer: null, bootstrapPending: false, bootstrapInstalling: false, bootstrapInstalled: false, bootstrapWanted: false, bootstrapBuffer: new Uint8Array(), bootstrapTimer: null, bootstrapFallbackTimer: null, sftpHistory: ["/"], sftpHistoryIndex: 0, tailFile: "", tailOffset: 0, tailInitialized: false, tailLines: [], tailLineBase: 0, tailPaused: false, tailMode: "last", tailCount: 100, tailFollow: true };
+  const record = { id, session, terminal, fit, fitObserver, search, host, connected: false, stopped: false, logging: false, logPath: "", latency: null, writeChain: Promise.resolve(), resizeTimer: null, inputTimer: null, inputQueue: [], inputBytes: 0, emptyReadCount: 0, cwdSyncTimer: null, bootstrapPending: false, bootstrapInstalling: false, bootstrapInstalled: false, bootstrapWanted: false, bootstrapBuffer: new Uint8Array(), bootstrapTimer: null, bootstrapFallbackTimer: null, sftpHistory: ["/"], sftpHistoryIndex: 0, tailFile: "", tailOffset: 0, tailInitialized: false, tailLines: [], tailLineBase: 0, tailPaused: false, tailMode: "last", tailCount: 100, tailFollow: true };
   state.terminals.set(id, record);
   terminal.parser.registerOscHandler(7, (data) => {
     if (!record.session.syncSftpPath) return true;
@@ -1096,8 +1098,10 @@ function createTerminalView(session) {
       .catch(() => {})
       .then(() => invoke(record.session.local ? "local_terminal_write" : "ssh_write", { id, data: Array.from(payload) }))
       .catch((error) => {
-        record.connected = false;
-        updateTerminalState(record, "error");
+        if (!String(error).includes("输入积压")) {
+          record.connected = false;
+          updateTerminalState(record, "error");
+        }
         toast(String(error), "error");
       });
   };
@@ -1215,9 +1219,19 @@ async function connectSavedSession(session) {
   if (session.authType === "password") {
     if (session.rememberPassword) {
       try { secret = await invoke("credential_get", { sessionId: session.id }) || ""; }
-      catch (error) { return toast(String(error), "error"); }
+      catch (error) { toast(String(error), "error"); }
     }
     if (!secret) return openSessionModal(session, "connect");
+  }
+  if (session.authType === "publickey") return openSessionModal(session, "connect");
+  if (!session.fingerprint) {
+    try {
+      const probe = await invoke("probe_host", { request: { host: session.host, port: session.port, timeoutSeconds: session.timeout } });
+      session.fingerprint = probe.fingerprint;
+      persistSessions();
+    } catch (error) {
+      return toast(String(error), "error");
+    }
   }
   await connectSession(session, secret);
 }
@@ -1256,7 +1270,11 @@ async function readLoop(record) {
       record.terminal.writeln(`\r\n\x1b[90m${record.session.local ? tr("本地终端已结束", "Local terminal ended") : tr("远程会话已结束", "Remote session ended")}${exitText}\x1b[0m`);
       return;
     }
-    const delay = result.data.length ? 16 : state.activeId === record.id ? 75 : 500;
+    record.emptyReadCount = result.data.length ? 0 : Math.min(record.emptyReadCount + 1, 6);
+    const idleDelay = state.activeId === record.id
+      ? Math.min(150, 75 * 2 ** Math.min(Math.max(record.emptyReadCount - 1, 0), 1))
+      : Math.min(1500, 500 * 2 ** Math.min(Math.max(record.emptyReadCount - 1, 0), 2));
+    const delay = result.data.length || result.pendingInput ? 16 : idleDelay;
     setTimeout(() => readLoop(record), delay);
   } catch (error) {
     if (!record.stopped) {
@@ -1503,7 +1521,7 @@ async function invokeSftpWithReconnect(command, args, terminalId) {
   try {
     return await invoke(command, args);
   } catch (firstError) {
-    if (!isTransientSftpError(firstError)) throw firstError;
+    if (!isRetryableSftpCommand(command) || !isTransientSftpError(firstError)) throw firstError;
     try {
       await invoke("sftp_reconnect", { id: terminalId });
       return await invoke(command, args);
@@ -1596,6 +1614,26 @@ function renderTransferTasks() {
   }).join("");
 }
 
+function scheduleTransferProgressRender() {
+  if (state.transferRenderFrame !== null) return;
+  state.transferRenderFrame = requestAnimationFrame(() => {
+    state.transferRenderFrame = null;
+    const active = [...state.transferMeta.values()].filter((item) => item.status === "running");
+    if (!active.length) return renderTransferTasks();
+    const transferred = active.reduce((sum, item) => sum + (item.transferred || 0), 0);
+    const knownTotals = active.filter((item) => item.total > 0);
+    const total = knownTotals.reduce((sum, item) => sum + item.total, 0);
+    const allTotalsKnown = knownTotals.length === active.length && total > 0;
+    const startedAt = Math.min(...active.map((item) => item.startedAt));
+    const seconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
+    const percent = allTotalsKnown ? transferred / total * 100 : null;
+    const sizeText = total ? `${formatSize(transferred)} / ${formatSize(total)}` : formatSize(transferred);
+    const taskText = active.length > 1 ? `${active.length} 个任务` : active[0].name;
+    setTransfer(`${taskText} · ${sizeText} · ${formatSize(transferred / seconds)}/s`, true, percent);
+    renderTransferTasks();
+  });
+}
+
 function trimTransferTasks() {
   const removable = [...state.transferMeta.entries()].filter(([, task]) => !["queued", "running"].includes(task.status));
   removable.slice(0, Math.max(0, removable.length - 100)).forEach(([id]) => {
@@ -1655,6 +1693,11 @@ async function uploadPaths(localPaths) {
   if (!localPaths.length) return;
   const destinationPath = state.remotePath;
   const names = localPaths.map((path) => path.replaceAll("\\", "/").split("/").pop());
+  const duplicateNames = duplicateBaseNames(localPaths);
+  if (duplicateNames.length) {
+    const preview = duplicateNames.slice(0, 5).join("、");
+    return toast(`所选项目包含同名文件：${preview}。请分批上传或先重命名。`, "error");
+  }
   const conflicts = names.filter((name) => state.remoteEntries.some((entry) => entry.name === name));
   if (conflicts.length) {
     const preview = conflicts.slice(0, 5).join("、");
@@ -1763,6 +1806,9 @@ function findInEditor(previous = false) {
 async function openRemoteEditor(item = state.selectedRemote) {
   const record = activeTerminal();
   if (!record?.connected || !item || item.isDir) return;
+  if (!isPreviewableTextFile(item.name)) {
+    return toast(`${item.name} 不是支持预览的文本文件，请下载后使用对应程序打开`, "error");
+  }
   if (isTauri) {
     const query = new URLSearchParams({
       sessionId: record.id,
@@ -1789,7 +1835,11 @@ async function openRemoteEditor(item = state.selectedRemote) {
   el("saveRemoteEditor").disabled = true;
   el("editorModal").classList.remove("hidden");
   try {
-    const result = await invokeSftpWithReconnect("sftp_read_text", { id: record.id, path: item.path }, record.id);
+    const result = await invokeSftpWithReconnect("sftp_read_text", {
+      id: record.id,
+      path: item.path,
+      maxBytes: state.preferences.fileEditLimitMb * 1024 * 1024,
+    }, record.id);
     if (state.activeId !== record.id || el("editorModal").classList.contains("hidden")) return;
     state.editorTerminalId = record.id;
     state.editorPath = item.path;
@@ -2253,7 +2303,7 @@ async function refreshServerMonitor() {
       el("monitorProcessBar").style.width = `${Math.min(100, (Number(values.PROC) || 0) / 5)}%`;
     } catch { el("monitorState").textContent = tr("读取失败", "Failed to load"); }
   }
-  state.monitorTimer = setTimeout(refreshServerMonitor, 5000);
+  state.monitorTimer = setTimeout(refreshServerMonitor, 10000);
 }
 
 function setSftpWidth(width, persist = false) {
@@ -2584,13 +2634,19 @@ async function requestAppClose() {
   if (state.closing) return;
   state.closing = true;
   el("closeWindow").disabled = true;
-  if (state.activeTransferIds.size) {
+  const pendingTransferIds = [...state.transferMeta.entries()]
+    .filter(([, task]) => ["queued", "running"].includes(task.status))
+    .map(([transferId]) => transferId);
+  if (pendingTransferIds.length) {
     const accepted = await appPrompt({ title: "退出 Orbiterm", message: "仍有文件正在传输。退出将取消传输，是否继续？", input: false, confirmText: "退出" });
     if (!accepted) {
       state.closing = false;
       el("closeWindow").disabled = false;
       return;
     }
+    pendingTransferIds.forEach((transferId) => {
+      if (state.transferMeta.get(transferId)?.status === "queued") unregisterTransfer(transferId, "cancelled");
+    });
     await Promise.all([...state.activeTransferIds].map((transferId) => invoke("cancel_transfer", { transferId }).catch(() => {})));
     if (state.transferPromises.size) {
       await Promise.race([
@@ -3093,18 +3149,7 @@ if (isTauri) {
     state.transferMeta.set(payload.transferId, meta);
     state.activeTransferId = payload.transferId;
     meta.status = "running";
-    const active = [...state.transferMeta.values()].filter((item) => item.status === "running");
-    const transferred = active.reduce((sum, item) => sum + (item.transferred || 0), 0);
-    const knownTotals = active.filter((item) => item.total > 0);
-    const total = knownTotals.reduce((sum, item) => sum + item.total, 0);
-    const allTotalsKnown = knownTotals.length === active.length && total > 0;
-    const startedAt = Math.min(...active.map((item) => item.startedAt));
-    const seconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
-    const percent = allTotalsKnown ? transferred / total * 100 : null;
-    const sizeText = total ? `${formatSize(transferred)} / ${formatSize(total)}` : formatSize(transferred);
-    const taskText = active.length > 1 ? `${active.length} 个任务` : meta.name;
-    setTransfer(`${taskText} · ${sizeText} · ${formatSize(transferred / seconds)}/s`, true, percent);
-    renderTransferTasks();
+    scheduleTransferProgressRender();
   }).catch(() => {});
 }
 

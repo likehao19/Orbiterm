@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh2::{Channel, FileStat, RenameFlags, Session, Sftp};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -20,6 +20,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 
 static TOOL_WINDOW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_PENDING_TERMINAL_INPUT: usize = 1024 * 1024;
 
 type SharedConnection = Arc<Mutex<SshConnection>>;
 type SharedSftp = Arc<Mutex<Sftp>>;
@@ -51,6 +52,8 @@ struct SshConnection {
     auth: AuthConfig,
     last_keepalive: Instant,
     terminal_read_failure_since: Option<Instant>,
+    pending_input: VecDeque<u8>,
+    pending_write_len: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -184,6 +187,7 @@ struct TerminalRead {
     eof: bool,
     exit_status: Option<i32>,
     log_error: Option<String>,
+    pending_input: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -198,7 +202,52 @@ fn join_blocking<T>(result: Result<Result<T, String>, tauri::Error>) -> Result<T
     result.map_err(|error| format!("后台任务失败：{error}"))?
 }
 
-fn open_session(host: &str, port: u16, timeout_seconds: u64) -> Result<(Session, u128), String> {
+fn is_retryable_terminal_transport_error(error: &std::io::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("failure while draining incoming flow") || message.contains("transport read")
+}
+
+fn pump_terminal_input<W: Write>(
+    writer: &mut W,
+    pending: &mut VecDeque<u8>,
+    pending_write_len: &mut Option<usize>,
+) -> Result<bool, String> {
+    for _ in 0..4 {
+        if pending.is_empty() {
+            *pending_write_len = None;
+            return Ok(false);
+        }
+        let requested = pending_write_len
+            .unwrap_or_else(|| pending.len().min(32_700))
+            .min(pending.len());
+        let chunk = pending.iter().take(requested).copied().collect::<Vec<_>>();
+        match writer.write(&chunk) {
+            Ok(0) => {
+                *pending_write_len = None;
+                return Ok(true);
+            }
+            Ok(written) => {
+                pending.drain(..written);
+                *pending_write_len = None;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || is_retryable_terminal_transport_error(&error) =>
+            {
+                *pending_write_len = Some(requested);
+                return Ok(true);
+            }
+            Err(error) => return Err(format!("写入终端失败：{error}")),
+        }
+    }
+    Ok(!pending.is_empty())
+}
+
+fn open_session(
+    host: &str,
+    port: u16,
+    timeout_seconds: u64,
+) -> Result<(Session, u128, TcpStream), String> {
     let addresses = format!("{host}:{port}")
         .to_socket_addrs()
         .map_err(|error| format!("无法解析主机：{error}"))?
@@ -208,10 +257,15 @@ fn open_session(host: &str, port: u16, timeout_seconds: u64) -> Result<(Session,
     }
     let timeout = Duration::from_secs(timeout_seconds.clamp(1, 300));
     let started = Instant::now();
+    let deadline = started + timeout;
     let mut last_error = None;
     let mut tcp = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
             Ok(stream) => {
                 tcp = Some(stream);
                 break;
@@ -227,17 +281,18 @@ fn open_session(host: &str, port: u16, timeout_seconds: u64) -> Result<(Session,
                 .unwrap_or_else(|| "未知网络错误".to_string())
         )
     })?;
-    tcp.set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
+    tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+    let socket_control = tcp
+        .try_clone()
+        .map_err(|error| format!("无法复制 SSH Socket：{error}"))?;
 
     let mut session = Session::new().map_err(|error| format!("SSH 初始化失败：{error}"))?;
+    session.set_timeout(timeout.as_millis().min(u128::from(u32::MAX)) as u32);
     session.set_tcp_stream(tcp);
     session
         .handshake()
         .map_err(|error| format!("SSH 握手失败：{error}"))?;
-    Ok((session, started.elapsed().as_millis()))
+    Ok((session, started.elapsed().as_millis(), socket_control))
 }
 
 #[tauri::command]
@@ -380,6 +435,7 @@ fn local_terminal_read(id: String, state: State<'_, AppState>) -> Result<Termina
         eof: terminal.eof,
         exit_status,
         log_error: None,
+        pending_input: false,
     })
 }
 
@@ -531,8 +587,9 @@ fn authenticate(session: &Session, auth: &AuthConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn open_authenticated_session(auth: &AuthConfig) -> Result<(Session, u128), String> {
-    let (session, latency_ms) = open_session(&auth.host, auth.port, auth.timeout_seconds)?;
+fn open_authenticated_session(auth: &AuthConfig) -> Result<(Session, u128, TcpStream), String> {
+    let (session, latency_ms, socket_control) =
+        open_session(&auth.host, auth.port, auth.timeout_seconds)?;
     let actual_fingerprint = fingerprint(&session)?;
     if auth.expected_fingerprint != actual_fingerprint {
         return Err(format!(
@@ -542,14 +599,14 @@ fn open_authenticated_session(auth: &AuthConfig) -> Result<(Session, u128), Stri
     }
     authenticate(&session, auth)?;
     session.set_keepalive(true, 20);
-    Ok((session, latency_ms))
+    Ok((session, latency_ms, socket_control))
 }
 
 #[tauri::command]
 async fn probe_host(request: ProbeRequest) -> Result<ProbeInfo, String> {
     join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
-            let (session, latency_ms) = open_session(
+            let (session, latency_ms, _) = open_session(
                 request.host.trim(),
                 request.port,
                 request.timeout_seconds.unwrap_or(15),
@@ -586,7 +643,7 @@ async fn ssh_connect(
                 expected_fingerprint: request.expected_fingerprint.clone(),
                 timeout_seconds: request.timeout_seconds.unwrap_or(20),
             };
-            let (session, latency_ms) = open_authenticated_session(&auth)?;
+            let (session, latency_ms, socket_control) = open_authenticated_session(&auth)?;
             let actual_fingerprint = fingerprint(&session)?;
             let mut channel = session
                 .channel_session()
@@ -609,7 +666,11 @@ async fn ssh_connect(
                     .shell()
                     .map_err(|error| format!("无法启动 Shell：{error}"))?;
             }
+            socket_control
+                .set_nonblocking(true)
+                .map_err(|error| format!("无法启用 SSH 非阻塞 Socket：{error}"))?;
             session.set_blocking(false);
+            session.set_timeout(0);
             let key_type = session
                 .host_key()
                 .map(|(_, kind)| format!("{kind:?}"))
@@ -620,6 +681,8 @@ async fn ssh_connect(
                 auth,
                 last_keepalive: Instant::now(),
                 terminal_read_failure_since: None,
+                pending_input: VecDeque::new(),
+                pending_write_len: None,
             }));
             Ok((
                 request.id,
@@ -661,10 +724,7 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
             let mut buffer = [0u8; 16 * 1024];
             loop {
                 match connection.channel.read(&mut buffer) {
-                    Ok(0) => {
-                        connection.terminal_read_failure_since = None;
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(count) => {
                         connection.terminal_read_failure_since = None;
                         output.extend_from_slice(&buffer[..count]);
@@ -673,11 +733,10 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        connection.terminal_read_failure_since = None;
                         break;
                     }
                     Err(error)
-                        if error.to_string().to_lowercase().contains("transport read")
+                        if is_retryable_terminal_transport_error(&error)
                             && !connection.channel.eof()
                             && connection
                                 .terminal_read_failure_since
@@ -699,6 +758,15 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
                     Err(error) => return Err(format!("SSH keepalive 失败：{error}")),
                 }
             }
+            let pending_input = {
+                let SshConnection {
+                    channel,
+                    pending_input,
+                    pending_write_len,
+                    ..
+                } = &mut *connection;
+                pump_terminal_input(channel, pending_input, pending_write_len).unwrap_or(true)
+            };
             let eof = connection.channel.eof();
             let exit_status = if eof {
                 connection.channel.exit_status().ok()
@@ -710,6 +778,7 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
                 eof,
                 exit_status,
                 log_error: None,
+                pending_input,
             })
         })
         .await,
@@ -734,47 +803,21 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
 #[tauri::command]
 async fn ssh_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Result<(), String> {
     let connection = get_connection(&id, &state)?;
-    join_blocking(
-        tauri::async_runtime::spawn_blocking(move || {
-            let mut connection = connection.lock().map_err(|_| "连接已损坏".to_string())?;
-            let mut offset = 0;
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while offset < data.len() {
-                match connection.channel.write(&data[offset..]) {
-                    Ok(0) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
-                    Ok(0) => return Err("终端写入超时".to_string()),
-                    Ok(count) => offset += count,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        return Err("终端写入缓冲区超时".to_string());
-                    }
-                    Err(error) => return Err(format!("写入终端失败：{error}")),
-                }
-            }
-            loop {
-                match connection.channel.flush() {
-                    Ok(()) => break,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        return Err("刷新终端输出超时".to_string());
-                    }
-                    Err(error) => return Err(format!("刷新终端输出失败：{error}")),
-                }
-            }
-            Ok(())
-        })
-        .await,
-    )
+    let mut connection = connection.lock().map_err(|_| "连接已损坏".to_string())?;
+    if connection.pending_input.len().saturating_add(data.len()) > MAX_PENDING_TERMINAL_INPUT {
+        return Err("终端输入积压超过 1 MB，请先按 Ctrl+C 停止不读取输入的远程程序".to_string());
+    }
+    connection.pending_input.extend(data);
+    {
+        let SshConnection {
+            channel,
+            pending_input,
+            pending_write_len,
+            ..
+        } = &mut *connection;
+        let _ = pump_terminal_input(channel, pending_input, pending_write_len);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -897,18 +940,40 @@ fn remote_transfer_path(path: &str, transfer_id: &str) -> String {
 async fn sftp_read_text(
     id: String,
     path: String,
+    max_bytes: Option<u64>,
     state: State<'_, AppState>,
 ) -> Result<RemoteFileContent, String> {
     let sftp = get_or_open_sftp(&id, &state).await?;
     join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
             let sftp = sftp.lock().map_err(|_| "SFTP 连接已损坏".to_string())?;
-            let mut file = sftp
+            let size = sftp
+                .stat(Path::new(&path))
+                .map_err(|error| format!("无法读取远程文件状态：{error}"))?
+                .size
+                .unwrap_or(0);
+            let limit = max_bytes
+                .unwrap_or(32 * 1024 * 1024)
+                .clamp(1024 * 1024, 64 * 1024 * 1024);
+            if size > limit {
+                return Err(format!(
+                    "文件大小为 {:.1} MB，超过编辑器 {:.1} MB 的安全上限，请使用大文件查看器",
+                    size as f64 / 1024.0 / 1024.0,
+                    limit as f64 / 1024.0 / 1024.0
+                ));
+            }
+            let file = sftp
                 .open(Path::new(&path))
                 .map_err(|error| format!("无法打开远程文件：{error}"))?;
             let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
+            file.take(limit + 1)
+                .read_to_end(&mut bytes)
                 .map_err(|error| format!("读取远程文件失败：{error}"))?;
+            if bytes.len() as u64 > limit {
+                return Err(
+                    "远程文件在读取过程中超过编辑器安全上限，请使用大文件查看器".to_string()
+                );
+            }
             let size = bytes.len();
             match String::from_utf8(bytes) {
                 Ok(content) => Ok(RemoteFileContent {
@@ -1099,7 +1164,7 @@ async fn ssh_tail(
             format!("tail -n {count} -- {quoted_path}")
         }
     } else {
-        let limit = max_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
+        let limit = max_bytes.clamp(1024 * 1024, 256 * 1024 * 1024);
         format!(
             "if [ \"$size\" -gt {limit} ]; then printf '\\036ORBITERM_LIMIT\\037'; else cat -- {quoted_path}; fi"
         )
@@ -1109,7 +1174,7 @@ async fn ssh_tail(
     );
     let output = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
-            let (session, _) = open_authenticated_session(&auth)?;
+            let (session, _, _) = open_authenticated_session(&auth)?;
             let mut channel = session
                 .channel_session()
                 .map_err(|error| format!("无法创建日志通道：{error}"))?;
@@ -1161,10 +1226,16 @@ fn replace_local_file(temp: &Path, target: &Path, backup: &Path) -> Result<(), S
         }
         std::fs::rename(target, backup).map_err(|error| format!("无法备份原文件：{error}"))?;
         if let Err(error) = std::fs::rename(temp, target) {
-            std::fs::rename(backup, target).ok();
-            return Err(format!("无法替换下载文件：{error}"));
+            return match std::fs::rename(backup, target) {
+                Ok(()) => Err(format!("无法替换下载文件，已恢复原文件：{error}")),
+                Err(restore_error) => Err(format!(
+                    "无法替换下载文件且恢复原文件失败：{error}；原文件保留在 {}：{restore_error}",
+                    backup.display()
+                )),
+            };
         }
-        std::fs::remove_file(backup).ok();
+        std::fs::remove_file(backup)
+            .map_err(|error| format!("文件已下载，但无法删除备份 {}：{error}", backup.display()))?;
     } else {
         std::fs::rename(temp, target).map_err(|error| format!("无法保存下载文件：{error}"))?;
     }
@@ -1178,10 +1249,16 @@ fn replace_local_directory(temp: &Path, target: &Path, backup: &Path) -> Result<
         }
         std::fs::rename(target, backup).map_err(|error| format!("无法备份原目录：{error}"))?;
         if let Err(error) = std::fs::rename(temp, target) {
-            std::fs::rename(backup, target).ok();
-            return Err(format!("无法提交下载目录：{error}"));
+            return match std::fs::rename(backup, target) {
+                Ok(()) => Err(format!("无法提交下载目录，已恢复原目录：{error}")),
+                Err(restore_error) => Err(format!(
+                    "无法提交下载目录且恢复原目录失败：{error}；原目录保留在 {}：{restore_error}",
+                    backup.display()
+                )),
+            };
         }
-        std::fs::remove_dir_all(backup).ok();
+        std::fs::remove_dir_all(backup)
+            .map_err(|error| format!("目录已下载，但无法删除备份 {}：{error}", backup.display()))?;
     } else {
         std::fs::rename(temp, target).map_err(|error| format!("无法保存下载目录：{error}"))?;
     }
@@ -1202,19 +1279,21 @@ async fn get_or_open_monitor_session(
     id: &str,
     state: &State<'_, AppState>,
 ) -> Result<SharedSession, String> {
-    if let Some(session) = state
-        .monitor_connections
-        .lock()
-        .map_err(|_| "监控连接管理器已损坏".to_string())?
-        .get(id)
-        .cloned()
     {
-        return Ok(session);
+        let mut connections = state
+            .monitor_connections
+            .lock()
+            .map_err(|_| "监控连接管理器已损坏".to_string())?;
+        connections.retain(|connection_id, _| connection_id == id);
+        if let Some(session) = connections.get(id).cloned() {
+            return Ok(session);
+        }
     }
-    let auth = connection_auth(id, state)?;
+    let mut auth = connection_auth(id, state)?;
+    auth.timeout_seconds = auth.timeout_seconds.min(10);
     let opened = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
-            let (session, _) = open_authenticated_session(&auth)?;
+            let (session, _, _) = open_authenticated_session(&auth)?;
             Ok(Arc::new(Mutex::new(session)))
         })
         .await,
@@ -1243,7 +1322,7 @@ async fn get_or_open_sftp(id: &str, state: &State<'_, AppState>) -> Result<Share
     let auth = connection_auth(id, state)?;
     let opened = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
-            let (session, _) = open_authenticated_session(&auth)?;
+            let (session, _, _) = open_authenticated_session(&auth)?;
             let sftp = session
                 .sftp()
                 .map_err(|error| format!("SFTP 初始化失败：{error}"))?;
@@ -1276,10 +1355,11 @@ async fn get_or_open_transfer_sftp(
     {
         return Ok((key, sftp));
     }
-    let auth = connection_auth(id, state)?;
+    let mut auth = connection_auth(id, state)?;
+    auth.timeout_seconds = auth.timeout_seconds.min(15);
     let opened = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
-            let (session, _) = open_authenticated_session(&auth)?;
+            let (session, _, _) = open_authenticated_session(&auth)?;
             let sftp = session
                 .sftp()
                 .map_err(|error| format!("SFTP 初始化失败：{error}"))?;
@@ -1304,6 +1384,31 @@ fn remove_transfer_sftp(key: &str, state: &State<'_, AppState>) -> Result<(), St
         .lock()
         .map_err(|_| "传输连接管理器已损坏".to_string())?
         .remove(key);
+    Ok(())
+}
+
+fn register_transfer_cancel(
+    transfer_id: &str,
+    state: &State<'_, AppState>,
+) -> Result<Arc<AtomicBool>, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .transfers
+        .lock()
+        .map_err(|_| "传输管理器已损坏".to_string())?
+        .insert(transfer_id.to_string(), cancel.clone());
+    Ok(cancel)
+}
+
+fn unregister_transfer_cancel(
+    transfer_id: &str,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .transfers
+        .lock()
+        .map_err(|_| "传输管理器已损坏".to_string())?
+        .remove(transfer_id);
     Ok(())
 }
 
@@ -1340,42 +1445,56 @@ async fn sftp_list(
             let sftp = sftp.lock().map_err(|_| "SFTP 连接已损坏".to_string())?;
             let user_names = cached_users.unwrap_or_else(|| {
                 let mut names = HashMap::new();
-                if let Ok(mut passwd) = sftp.open(Path::new("/etc/passwd")) {
+                if let Ok(passwd) = sftp.open(Path::new("/etc/passwd")) {
                     let mut content = String::new();
-                    if passwd.read_to_string(&mut content).is_ok() {
+                    if passwd
+                        .take(1024 * 1024)
+                        .read_to_string(&mut content)
+                        .is_ok()
+                    {
                         names = parse_passwd(&content);
                     }
                 }
                 names
             });
-            let mut entries = sftp
-                .readdir(Path::new(&path))
-                .map_err(|error| format!("无法读取远程目录：{error}"))?
-                .into_iter()
-                .filter_map(|(item_path, stat)| {
-                    let name = remote_name(&item_path);
-                    if name == "." || name == ".." {
-                        return None;
-                    }
-                    Some(RemoteEntry {
-                        name,
-                        path: item_path.to_string_lossy().replace('\\', "/"),
-                        is_dir: stat.is_dir(),
-                        size: stat.size.unwrap_or(0),
-                        modified: stat.mtime.unwrap_or(0),
-                        permissions: stat.perm.unwrap_or(0),
-                        owner: stat
-                            .uid
-                            .map(|uid| {
-                                user_names
-                                    .get(&uid)
-                                    .cloned()
-                                    .unwrap_or_else(|| uid.to_string())
-                            })
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect::<Vec<_>>();
+            let directory_path = Path::new(&path);
+            let mut directory = sftp
+                .opendir(directory_path)
+                .map_err(|error| format!("无法读取远程目录：{error}"))?;
+            let mut entries = Vec::new();
+            loop {
+                let (name_path, stat) = match directory.readdir() {
+                    Ok(entry) => entry,
+                    Err(error) if error.code() == ssh2::ErrorCode::Session(-16) => break,
+                    Err(error) if error.code() == ssh2::ErrorCode::Session(-37) => continue,
+                    Err(error) => return Err(format!("无法读取远程目录：{error}")),
+                };
+                let name = remote_name(&name_path);
+                if name == "." || name == ".." {
+                    continue;
+                }
+                if entries.len() >= 50_000 {
+                    return Err("目录超过 50000 个项目，请在服务器端缩小目录范围后重试".to_string());
+                }
+                let item_path = directory_path.join(&name_path);
+                entries.push(RemoteEntry {
+                    name,
+                    path: item_path.to_string_lossy().replace('\\', "/"),
+                    is_dir: stat.is_dir(),
+                    size: stat.size.unwrap_or(0),
+                    modified: stat.mtime.unwrap_or(0),
+                    permissions: stat.perm.unwrap_or(0),
+                    owner: stat
+                        .uid
+                        .map(|uid| {
+                            user_names
+                                .get(&uid)
+                                .cloned()
+                                .unwrap_or_else(|| uid.to_string())
+                        })
+                        .unwrap_or_default(),
+                });
+            }
             entries.sort_by(|left, right| {
                 right
                     .is_dir
@@ -1454,10 +1573,26 @@ async fn sftp_properties(
     join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
             let sftp = sftp.lock().map_err(|_| "SFTP 连接已损坏".to_string())?;
-            fn measure(sftp: &Sftp, path: &Path) -> Result<RemoteProperties, String> {
+            fn measure(
+                sftp: &Sftp,
+                path: &Path,
+                depth: usize,
+                visited: &mut usize,
+            ) -> Result<RemoteProperties, String> {
+                if depth > 128 || *visited >= 100_000 {
+                    return Err("目录层级或项目数量超过安全上限，已停止统计".to_string());
+                }
+                *visited += 1;
                 let stat = sftp
-                    .stat(path)
+                    .lstat(path)
                     .map_err(|error| format!("无法读取属性：{error}"))?;
+                if stat.file_type().is_symlink() {
+                    return Ok(RemoteProperties {
+                        size: stat.size.unwrap_or(0),
+                        files: 1,
+                        directories: 0,
+                    });
+                }
                 if !stat.is_dir() {
                     return Ok(RemoteProperties {
                         size: stat.size.unwrap_or(0),
@@ -1478,14 +1613,15 @@ async fn sftp_properties(
                     if name == "." || name == ".." {
                         continue;
                     }
-                    let value = measure(sftp, &child)?;
+                    let value = measure(sftp, &child, depth + 1, visited)?;
                     result.size += value.size;
                     result.files += value.files;
                     result.directories += value.directories;
                 }
                 Ok(result)
             }
-            measure(&sftp, Path::new(&path))
+            let mut visited = 0;
+            measure(&sftp, Path::new(&path), 0, &mut visited)
         })
         .await,
     )
@@ -1554,13 +1690,14 @@ async fn sftp_upload(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
-    let (connection_key, sftp) = get_or_open_transfer_sftp(&id, &worker_id, &state).await?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .insert(transfer_id.clone(), cancel.clone());
+    let cancel = register_transfer_cancel(&transfer_id, &state)?;
+    let (connection_key, sftp) = match get_or_open_transfer_sftp(&id, &worker_id, &state).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            unregister_transfer_cancel(&transfer_id, &state)?;
+            return Err(error);
+        }
+    };
     let transfer_key = transfer_id.clone();
     let result = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
@@ -1595,7 +1732,7 @@ async fn sftp_upload(
                         .write_all(&buffer[..count])
                         .map_err(|error| format!("上传失败：{error}"))?;
                     transferred += count as u64;
-                    if last_emit.elapsed() >= Duration::from_millis(100) || transferred == total {
+                    if last_emit.elapsed() >= Duration::from_millis(200) || transferred == total {
                         app.emit(
                             "transfer-progress",
                             TransferProgress {
@@ -1634,11 +1771,7 @@ async fn sftp_upload(
         })
         .await,
     );
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .remove(&transfer_key);
+    unregister_transfer_cancel(&transfer_key, &state)?;
     if result.as_ref().is_err_and(|error| error != "传输已取消") {
         remove_transfer_sftp(&connection_key, &state)?;
     }
@@ -1655,13 +1788,14 @@ async fn sftp_download(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
-    let (connection_key, sftp) = get_or_open_transfer_sftp(&id, &worker_id, &state).await?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .insert(transfer_id.clone(), cancel.clone());
+    let cancel = register_transfer_cancel(&transfer_id, &state)?;
+    let (connection_key, sftp) = match get_or_open_transfer_sftp(&id, &worker_id, &state).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            unregister_transfer_cancel(&transfer_id, &state)?;
+            return Err(error);
+        }
+    };
     let transfer_key = transfer_id.clone();
     let result = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
@@ -1699,7 +1833,7 @@ async fn sftp_download(
                         .write_all(&buffer[..count])
                         .map_err(|error| format!("写入本地文件失败：{error}"))?;
                     transferred += count as u64;
-                    if last_emit.elapsed() >= Duration::from_millis(100) || transferred == total {
+                    if last_emit.elapsed() >= Duration::from_millis(200) || transferred == total {
                         app.emit(
                             "transfer-progress",
                             TransferProgress {
@@ -1729,11 +1863,7 @@ async fn sftp_download(
         })
         .await,
     );
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .remove(&transfer_key);
+    unregister_transfer_cancel(&transfer_key, &state)?;
     if result.as_ref().is_err_and(|error| error != "传输已取消") {
         remove_transfer_sftp(&connection_key, &state)?;
     }
@@ -1750,13 +1880,14 @@ async fn sftp_download_tree(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
-    let (connection_key, sftp) = get_or_open_transfer_sftp(&id, &worker_id, &state).await?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .insert(transfer_id.clone(), cancel.clone());
+    let cancel = register_transfer_cancel(&transfer_id, &state)?;
+    let (connection_key, sftp) = match get_or_open_transfer_sftp(&id, &worker_id, &state).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            unregister_transfer_cancel(&transfer_id, &state)?;
+            return Err(error);
+        }
+    };
     let transfer_key = transfer_id.clone();
     let result = join_blocking(
         tauri::async_runtime::spawn_blocking(move || {
@@ -1776,12 +1907,18 @@ async fn sftp_download_tree(
                     return Err("传输已取消".to_string());
                 }
                 let stat = sftp
-                    .stat(remote)
+                    .lstat(remote)
                     .map_err(|error| format!("无法读取远程项目：{error}"))?;
+                if stat.file_type().is_symlink() {
+                    return Err(format!(
+                        "目录中包含不支持下载的符号链接：{}",
+                        remote.display()
+                    ));
+                }
                 if stat.is_dir() {
                     std::fs::create_dir_all(local)
                         .map_err(|error| format!("无法创建本地目录：{error}"))?;
-                    for (child, child_stat) in sftp
+                    for (child, _) in sftp
                         .readdir(remote)
                         .map_err(|error| format!("无法读取远程目录：{error}"))?
                     {
@@ -1790,7 +1927,6 @@ async fn sftp_download_tree(
                             continue;
                         }
                         let child_local = local.join(&name);
-                        let _ = child_stat;
                         download_tree(
                             sftp,
                             &child,
@@ -1828,7 +1964,7 @@ async fn sftp_download_tree(
                         .write_all(&buffer[..count])
                         .map_err(|error| format!("写入本地文件失败：{error}"))?;
                     *transferred += count as u64;
-                    if last_emit.elapsed() >= Duration::from_millis(100) {
+                    if last_emit.elapsed() >= Duration::from_millis(200) {
                         app.emit(
                             "transfer-progress",
                             TransferProgress {
@@ -1882,11 +2018,7 @@ async fn sftp_download_tree(
         })
         .await,
     );
-    state
-        .transfers
-        .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .remove(&transfer_key);
+    unregister_transfer_cancel(&transfer_key, &state)?;
     if result.as_ref().is_err_and(|error| error != "传输已取消") {
         remove_transfer_sftp(&connection_key, &state)?;
     }
@@ -2098,9 +2230,7 @@ fn update_tool_window_preferences(
 ) -> Result<(), String> {
     let normalized = ToolWindowPreferences {
         chunk_size: preferences.chunk_size.clamp(1024 * 1024, 64 * 1024 * 1024),
-        edit_limit: preferences
-            .edit_limit
-            .clamp(1024 * 1024, 1024 * 1024 * 1024),
+        edit_limit: preferences.edit_limit.clamp(1024 * 1024, 64 * 1024 * 1024),
     };
     for (label, window) in app.webview_windows() {
         if label.starts_with("tool-") {
@@ -2167,6 +2297,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WouldBlockOnce {
+        calls: usize,
+        requests: Vec<usize>,
+        output: Vec<u8>,
+    }
+
+    impl Write for WouldBlockOnce {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.requests.push(buffer.len());
+            if self.calls == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2241,5 +2393,44 @@ mod tests {
         assert_eq!(users.get(&0).map(String::as_str), Some("root"));
         assert_eq!(users.get(&1001).map(String::as_str), Some("tus"));
         assert_eq!(users.len(), 2);
+    }
+
+    #[test]
+    fn retries_only_known_terminal_transport_failures() {
+        assert!(is_retryable_terminal_transport_error(
+            &std::io::Error::other("Failure while draining incoming flow")
+        ));
+        assert!(is_retryable_terminal_transport_error(
+            &std::io::Error::other("transport read")
+        ));
+        assert!(!is_retryable_terminal_transport_error(
+            &std::io::Error::other("permission denied")
+        ));
+    }
+
+    #[test]
+    fn queued_terminal_input_preserves_the_eagain_buffer() {
+        let mut writer = WouldBlockOnce {
+            calls: 0,
+            requests: Vec::new(),
+            output: Vec::new(),
+        };
+        let mut pending = VecDeque::from(b"abcdef".to_vec());
+        let mut pending_write_len = None;
+
+        assert!(
+            pump_terminal_input(&mut writer, &mut pending, &mut pending_write_len)
+                .expect("would-block should keep data queued")
+        );
+        pending.extend(b"gh");
+        assert!(
+            !pump_terminal_input(&mut writer, &mut pending, &mut pending_write_len)
+                .expect("queued data should eventually flush")
+        );
+
+        assert_eq!(writer.requests, vec![6, 6, 2]);
+        assert_eq!(writer.output, b"abcdefgh");
+        assert!(pending.is_empty());
+        assert_eq!(pending_write_len, None);
     }
 }

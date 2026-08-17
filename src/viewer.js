@@ -30,7 +30,7 @@ let sessionClosed = false;
 let fileEof = false;
 const preferenceMb = (name, fallback, maximum) => Math.max(1, Math.min(maximum, Number(params.get(name)) || fallback)) * 1024 * 1024;
 let fileChunkSize = preferenceMb("chunkSizeMb", 4, 64);
-let editSizeLimit = preferenceMb("editLimitMb", 32, 1024);
+let editSizeLimit = preferenceMb("editLimitMb", 32, 64);
 
 document.documentElement.dataset.theme = params.get("theme") === "dark" ? "dark" : "light";
 document.documentElement.lang = english ? "en" : "zh-CN";
@@ -51,6 +51,14 @@ function showToast(message) {
   el("toast").textContent = message;
   el("toast").classList.remove("hidden");
   toastTimer = setTimeout(() => el("toast").classList.add("hidden"), 2400);
+}
+async function requestClose() {
+  if (!closeApproved && !el("editor").readOnly && el("editor").value !== original) {
+    el("confirmClose").classList.remove("hidden");
+    return;
+  }
+  closeApproved = true;
+  await appWindow.destroy();
 }
 function base64ToBytes(base64) {
   const normalized = base64.replaceAll("-", "+").replaceAll("_", "/");
@@ -188,13 +196,12 @@ el("findNext").addEventListener("click", () => find(true));
 el("findPrevious").addEventListener("click", () => find(true, true));
 el("toggleMaximize").addEventListener("click", () => appWindow.toggleMaximize());
 el("toggleFullscreen").addEventListener("click", async () => appWindow.setFullscreen(!(await appWindow.isFullscreen())));
+el("closeWindow").addEventListener("click", requestClose);
 el("keepEditing").addEventListener("click", () => el("confirmClose").classList.add("hidden"));
-el("discardChanges").addEventListener("click", async () => { closeApproved = true; await appWindow.destroy(); });
+el("discardChanges").addEventListener("click", async () => { closeApproved = true; await requestClose(); });
 appWindow.onCloseRequested((event) => {
-  if (!closeApproved && !el("editor").readOnly && el("editor").value !== original) {
-    event.preventDefault();
-    el("confirmClose").classList.remove("hidden");
-  }
+  event.preventDefault();
+  void requestClose();
 }).catch(() => {});
 if (isTauri) {
   listen("orbiterm-session-closed", () => {
@@ -208,7 +215,7 @@ if (isTauri) {
   }).catch(() => {});
   listen("orbiterm-tool-preferences", ({ payload }) => {
     fileChunkSize = Math.max(1024 * 1024, Math.min(64 * 1024 * 1024, Number(payload.chunkSize) || fileChunkSize));
-    editSizeLimit = Math.max(1024 * 1024, Math.min(1024 * 1024 * 1024, Number(payload.editLimit) || editSizeLimit));
+    editSizeLimit = Math.max(1024 * 1024, Math.min(64 * 1024 * 1024, Number(payload.editLimit) || editSizeLimit));
     const editable = fileEof && !binary && totalSize <= editSizeLimit && !sessionClosed;
     if (!editable && !el("editor").readOnly) {
       el("editor").readOnly = true;
