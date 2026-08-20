@@ -1,9 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import appIconUrl from "../src-tauri/icons/32x32.png";
 import "./viewer.css";
 
-const params = new URLSearchParams(location.search);
+let injectedQuery = typeof window.__ORBITERM_VIEWER_QUERY__ === "string" ? window.__ORBITERM_VIEWER_QUERY__ : "";
+if (!injectedQuery && "__TAURI_INTERNALS__" in window) {
+  const request = await invoke("current_tool_window_request");
+  injectedQuery = request.query;
+}
+if (!injectedQuery) injectedQuery = location.search;
+const params = new URLSearchParams(injectedQuery);
 const sessionId = params.get("sessionId") || "";
 const path = params.get("path") || "";
 const name = params.get("name") || path.split("/").pop() || "远程文件";
@@ -11,10 +18,13 @@ const english = params.get("language") === "en-US";
 const isTauri = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauri ? getCurrentWindow() : {
   toggleMaximize: async () => {},
+  minimize: async () => {},
+  isMaximized: async () => false,
   isFullscreen: async () => false,
   setFullscreen: async () => {},
   destroy: async () => window.close(),
   onCloseRequested: async () => () => {},
+  onResized: async () => () => {},
 };
 const el = (id) => document.getElementById(id);
 let original = "";
@@ -34,10 +44,28 @@ let editSizeLimit = preferenceMb("editLimitMb", 32, 64);
 
 document.documentElement.dataset.theme = params.get("theme") === "dark" ? "dark" : "light";
 document.documentElement.lang = english ? "en" : "zh-CN";
+const defaultWrapping = params.get("wrap") === "true";
+const defaultLineNumbers = params.get("lineNumbers") !== "false";
+const previewFontSize = Math.max(10, Math.min(24, Number(params.get("fontSize")) || 13));
 el("fileName").textContent = name;
 el("filePath").textContent = path;
+el("appIcon").src = appIconUrl;
+document.title = `${name} — Orbiterm`;
+el("editor").style.fontSize = `${previewFontSize}px`;
+el("lineNumbers").style.fontSize = `${previewFontSize}px`;
+el("editor").classList.toggle("wrap-enabled", defaultWrapping);
+el("editor").wrap = defaultWrapping ? "soft" : "off";
+el("toggleWrap").classList.toggle("active", defaultWrapping);
+el("lineNumbers").classList.toggle("hidden", !defaultLineNumbers);
+el("editor").classList.toggle("no-lines", !defaultLineNumbers);
+el("toggleLines").classList.toggle("active", defaultLineNumbers);
 
 function tr(zh, en) { return english ? en : zh; }
+function setButtonLabel(button, zh, en) {
+  const label = tr(zh, en);
+  button.title = label;
+  button.setAttribute("aria-label", label);
+}
 function formatSize(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1024) return `${bytes || 0} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -58,7 +86,8 @@ async function requestClose() {
     return;
   }
   closeApproved = true;
-  await appWindow.destroy();
+  if (isTauri) await invoke("close_current_tool_window");
+  else await appWindow.destroy();
 }
 function base64ToBytes(base64) {
   const normalized = base64.replaceAll("-", "+").replaceAll("_", "/");
@@ -83,9 +112,30 @@ async function readRemote() {
   fileOffset = 0;
   totalSize = 0;
   binary = false;
+  fileEof = false;
+  original = "";
   streamingDecoder = null;
   el("editor").value = "";
-  await loadNextChunk();
+  return loadNextChunk();
+}
+async function refreshRemote() {
+  if (!el("editor").readOnly && el("editor").value !== original) {
+    showToast(tr("当前有未保存修改，请先保存再刷新", "Save your changes before refreshing"));
+    return;
+  }
+  const button = el("refreshFile");
+  button.disabled = true;
+  button.classList.add("refreshing");
+  el("loading").classList.remove("hidden");
+  el("editor").readOnly = true;
+  el("toggleEdit").classList.remove("active");
+  el("saveFile").disabled = true;
+  try {
+    if (await readRemote()) showToast(tr("已刷新远程文件", "Remote file refreshed"));
+  } finally {
+    button.disabled = sessionClosed;
+    button.classList.remove("refreshing");
+  }
 }
 async function loadNextChunk() {
   if (sessionClosed) return showToast(tr("原终端会话已关闭", "The terminal session has been closed"));
@@ -129,10 +179,14 @@ async function loadNextChunk() {
       ? (editable ? tr("只读预览，可切换编辑", "Read-only preview; editing is available") : tr("只读预览", "Read-only preview"))
       : tr("已分块加载，点击“继续加载”读取后续内容", "Loaded in chunks; choose Load more to continue");
     updateLines();
+    return true;
   } catch (error) {
     el("status").textContent = tr("读取失败", "Read failed");
+    el("editor").value = `${tr("无法读取远程文件", "Unable to read the remote file")}\n\n${String(error)}`;
+    updateLines();
     showToast(String(error));
     el("loadMore").disabled = false;
+    return false;
   } finally { el("loading").classList.add("hidden"); }
 }
 async function saveRemote() {
@@ -175,7 +229,7 @@ el("toggleEdit").addEventListener("click", () => {
   el("editor").readOnly = !el("editor").readOnly;
   const editing = !el("editor").readOnly;
   el("toggleEdit").classList.toggle("active", editing);
-  el("toggleEdit").textContent = editing ? tr("只读", "Read only") : tr("编辑", "Edit");
+  setButtonLabel(el("toggleEdit"), editing ? "切换为只读" : "编辑", editing ? "Switch to read only" : "Edit");
   el("saveFile").disabled = !editing;
   el("status").textContent = editing ? tr("编辑模式", "Edit mode") : tr("只读预览", "Read-only preview");
   if (editing) el("editor").focus();
@@ -184,30 +238,50 @@ el("toggleLines").addEventListener("click", () => {
   const hidden = el("lineNumbers").classList.toggle("hidden");
   el("editor").classList.toggle("no-lines", hidden);
   el("toggleLines").classList.toggle("active", !hidden);
+  setButtonLabel(el("toggleLines"), hidden ? "显示行号" : "隐藏行号", hidden ? "Show line numbers" : "Hide line numbers");
+});
+el("toggleWrap").addEventListener("click", () => {
+  const wrapping = !el("editor").classList.contains("wrap-enabled");
+  el("editor").classList.toggle("wrap-enabled", wrapping);
+  el("editor").wrap = wrapping ? "soft" : "off";
+  el("toggleWrap").classList.toggle("active", wrapping);
+  setButtonLabel(el("toggleWrap"), wrapping ? "关闭自动换行" : "自动换行", wrapping ? "Disable word wrap" : "Enable word wrap");
 });
 el("editor").addEventListener("input", () => { updateLines(); el("status").textContent = tr("未保存", "Unsaved"); });
 el("editor").addEventListener("scroll", () => { el("lineNumbers").scrollTop = el("editor").scrollTop; });
 el("saveFile").addEventListener("click", saveRemote);
 el("loadMore").addEventListener("click", loadNextChunk);
+el("refreshFile").addEventListener("click", refreshRemote);
 el("openFind").addEventListener("click", () => { el("findBar").classList.remove("hidden"); el("findInput").focus(); el("findInput").select(); });
 el("closeFind").addEventListener("click", () => el("findBar").classList.add("hidden"));
 el("findInput").addEventListener("input", () => find(false));
 el("findNext").addEventListener("click", () => find(true));
 el("findPrevious").addEventListener("click", () => find(true, true));
-el("toggleMaximize").addEventListener("click", () => appWindow.toggleMaximize());
-el("toggleFullscreen").addEventListener("click", async () => appWindow.setFullscreen(!(await appWindow.isFullscreen())));
+el("minimizeWindow").addEventListener("click", () => appWindow.minimize());
+async function syncMaximizeButton() {
+  const maximized = await appWindow.isMaximized();
+  el("toggleMaximize").classList.toggle("is-maximized", maximized);
+  setButtonLabel(el("toggleMaximize"), maximized ? "还原" : "最大化", maximized ? "Restore" : "Maximize");
+}
+el("toggleMaximize").addEventListener("click", async () => { await appWindow.toggleMaximize(); await syncMaximizeButton(); });
 el("closeWindow").addEventListener("click", requestClose);
 el("keepEditing").addEventListener("click", () => el("confirmClose").classList.add("hidden"));
 el("discardChanges").addEventListener("click", async () => { closeApproved = true; await requestClose(); });
+el("confirmClose").addEventListener("click", (event) => { if (event.target === el("confirmClose")) el("confirmClose").classList.add("hidden"); });
 appWindow.onCloseRequested((event) => {
   event.preventDefault();
   void requestClose();
 }).catch(() => {});
+appWindow.onResized(() => { void syncMaximizeButton(); }).catch(() => {});
+document.querySelector(".viewer-head").addEventListener("dblclick", (event) => {
+  if (!event.target.closest("button")) void appWindow.toggleMaximize().then(syncMaximizeButton);
+});
 if (isTauri) {
   listen("orbiterm-session-closed", () => {
     sessionClosed = true;
     el("editor").readOnly = true;
     el("toggleEdit").disabled = true;
+    el("refreshFile").disabled = true;
     el("saveFile").disabled = true;
     el("loadMore").disabled = true;
     el("status").textContent = tr("原终端会话已关闭，仅保留当前预览", "The terminal session is closed; the current preview is retained");
@@ -224,14 +298,37 @@ if (isTauri) {
       showToast(tr("新的文件编辑上限已生效，当前文件切换为只读", "The new edit limit is active; this file is now read-only"));
     }
     el("toggleEdit").disabled = !editable;
+    const wrapping = Boolean(payload.wrap);
+    const linesVisible = Boolean(payload.lineNumbers);
+    const fontSize = Math.max(10, Math.min(24, Number(payload.fontSize) || previewFontSize));
+    el("editor").classList.toggle("wrap-enabled", wrapping);
+    el("editor").wrap = wrapping ? "soft" : "off";
+    el("toggleWrap").classList.toggle("active", wrapping);
+    el("lineNumbers").classList.toggle("hidden", !linesVisible);
+    el("editor").classList.toggle("no-lines", !linesVisible);
+    el("toggleLines").classList.toggle("active", linesVisible);
+    el("editor").style.fontSize = `${fontSize}px`;
+    el("lineNumbers").style.fontSize = `${fontSize}px`;
+    setButtonLabel(el("toggleWrap"), wrapping ? "关闭自动换行" : "自动换行", wrapping ? "Disable word wrap" : "Enable word wrap");
+    setButtonLabel(el("toggleLines"), linesVisible ? "隐藏行号" : "显示行号", linesVisible ? "Hide line numbers" : "Show line numbers");
   }).catch(() => {});
 }
 document.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   if (event.ctrlKey && key === "s") { event.preventDefault(); void saveRemote(); }
   if (event.ctrlKey && key === "f") { event.preventDefault(); el("findBar").classList.remove("hidden"); el("findInput").focus(); el("findInput").select(); }
+  if (event.key === "F12" && isTauri) { event.preventDefault(); void invoke("open_current_devtools"); }
   if (event.key === "F11") { event.preventDefault(); void appWindow.isFullscreen().then((value) => appWindow.setFullscreen(!value)); }
-  if (event.key === "Escape" && !el("findBar").classList.contains("hidden")) el("findBar").classList.add("hidden");
+  if (event.key === "Escape" && !el("confirmClose").classList.contains("hidden")) el("confirmClose").classList.add("hidden");
+  else if (event.key === "Escape" && !el("findBar").classList.contains("hidden")) el("findBar").classList.add("hidden");
 });
 
+setButtonLabel(el("refreshFile"), "刷新", "Refresh");
+setButtonLabel(el("toggleEdit"), "编辑", "Edit");
+setButtonLabel(el("toggleWrap"), defaultWrapping ? "关闭自动换行" : "自动换行", defaultWrapping ? "Disable word wrap" : "Enable word wrap");
+setButtonLabel(el("toggleLines"), defaultLineNumbers ? "隐藏行号" : "显示行号", defaultLineNumbers ? "Hide line numbers" : "Show line numbers");
+setButtonLabel(el("openFind"), "查找", "Find");
+setButtonLabel(el("minimizeWindow"), "最小化", "Minimize");
+setButtonLabel(el("closeWindow"), "关闭", "Close");
+void syncMaximizeButton();
 void readRemote();

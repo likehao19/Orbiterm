@@ -36,6 +36,7 @@ struct AppState {
     user_names: Mutex<HashMap<String, HashMap<u32, String>>>,
     transfers: Mutex<HashMap<String, Arc<AtomicBool>>>,
     logs: Mutex<HashMap<String, File>>,
+    tool_window_requests: Mutex<HashMap<String, ToolWindowRequest>>,
 }
 
 struct LocalTerminal {
@@ -67,6 +68,7 @@ struct AuthConfig {
     passphrase: Option<String>,
     expected_fingerprint: String,
     timeout_seconds: u64,
+    keepalive_seconds: u32,
 }
 
 #[derive(Deserialize)]
@@ -94,9 +96,10 @@ struct ConnectRequest {
     cols: u32,
     rows: u32,
     timeout_seconds: Option<u64>,
+    keepalive_seconds: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolWindowRequest {
     kind: String,
@@ -110,6 +113,9 @@ struct ToolWindowRequest {
 struct ToolWindowPreferences {
     chunk_size: u64,
     edit_limit: u64,
+    wrap: bool,
+    line_numbers: bool,
+    font_size: u16,
 }
 
 #[derive(Serialize)]
@@ -598,7 +604,7 @@ fn open_authenticated_session(auth: &AuthConfig) -> Result<(Session, u128, TcpSt
         ));
     }
     authenticate(&session, auth)?;
-    session.set_keepalive(true, 20);
+    session.set_keepalive(true, auth.keepalive_seconds);
     Ok((session, latency_ms, socket_control))
 }
 
@@ -642,6 +648,7 @@ async fn ssh_connect(
                 passphrase: request.passphrase.clone(),
                 expected_fingerprint: request.expected_fingerprint.clone(),
                 timeout_seconds: request.timeout_seconds.unwrap_or(20),
+                keepalive_seconds: request.keepalive_seconds.unwrap_or(20).clamp(5, 300),
             };
             let (session, latency_ms, socket_control) = open_authenticated_session(&auth)?;
             let actual_fingerprint = fingerprint(&session)?;
@@ -751,7 +758,9 @@ async fn ssh_read(id: String, state: State<'_, AppState>) -> Result<TerminalRead
                     Err(error) => return Err(format!("读取终端失败：{error}")),
                 }
             }
-            if connection.last_keepalive.elapsed() >= Duration::from_secs(15) {
+            if connection.last_keepalive.elapsed()
+                >= Duration::from_secs(u64::from(connection.auth.keepalive_seconds))
+            {
                 match connection.session.keepalive_send() {
                     Ok(_) => connection.last_keepalive = Instant::now(),
                     Err(error) if error.code() == ssh2::ErrorCode::Session(-37) => {}
@@ -1391,13 +1400,14 @@ fn register_transfer_cancel(
     transfer_id: &str,
     state: &State<'_, AppState>,
 ) -> Result<Arc<AtomicBool>, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    state
+    let mut transfers = state
         .transfers
         .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .insert(transfer_id.to_string(), cancel.clone());
-    Ok(cancel)
+        .map_err(|_| "传输管理器已损坏".to_string())?;
+    Ok(transfers
+        .entry(transfer_id.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone())
 }
 
 fn unregister_transfer_cancel(
@@ -1894,6 +1904,34 @@ async fn sftp_download_tree(
             let sftp = sftp
                 .lock()
                 .map_err(|_| "传输 SFTP 连接已损坏".to_string())?;
+            fn tree_size(sftp: &Sftp, remote: &Path, cancel: &AtomicBool) -> Result<u64, String> {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("传输已取消".to_string());
+                }
+                let stat = sftp
+                    .lstat(remote)
+                    .map_err(|error| format!("无法读取远程项目：{error}"))?;
+                if stat.file_type().is_symlink() {
+                    return Err(format!(
+                        "目录中包含不支持下载的符号链接：{}",
+                        remote.display()
+                    ));
+                }
+                if !stat.is_dir() {
+                    return Ok(stat.size.unwrap_or(0));
+                }
+                let mut total = 0u64;
+                for (child, _) in sftp
+                    .readdir(remote)
+                    .map_err(|error| format!("无法读取远程目录：{error}"))?
+                {
+                    let name = remote_name(&child);
+                    if name != "." && name != ".." {
+                        total = total.saturating_add(tree_size(sftp, &child, cancel)?);
+                    }
+                }
+                Ok(total)
+            }
             fn download_tree(
                 sftp: &Sftp,
                 remote: &Path,
@@ -1902,6 +1940,7 @@ async fn sftp_download_tree(
                 cancel: &AtomicBool,
                 app: &AppHandle,
                 transferred: &mut u64,
+                total: u64,
             ) -> Result<(), String> {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("传输已取消".to_string());
@@ -1935,6 +1974,7 @@ async fn sftp_download_tree(
                             cancel,
                             app,
                             transferred,
+                            total,
                         )?;
                     }
                     return Ok(());
@@ -1970,7 +2010,7 @@ async fn sftp_download_tree(
                             TransferProgress {
                                 transfer_id: transfer_id.to_string(),
                                 transferred: *transferred,
-                                total: 0,
+                                total,
                             },
                         )
                         .ok();
@@ -1982,7 +2022,7 @@ async fn sftp_download_tree(
                     TransferProgress {
                         transfer_id: transfer_id.to_string(),
                         transferred: *transferred,
-                        total: 0,
+                        total,
                     },
                 )
                 .ok();
@@ -1995,6 +2035,16 @@ async fn sftp_download_tree(
                 std::fs::remove_dir_all(&temp)
                     .map_err(|error| format!("无法清理下载临时目录：{error}"))?;
             }
+            let total = tree_size(&sftp, Path::new(&remote_path), &cancel)?;
+            app.emit(
+                "transfer-progress",
+                TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    transferred: 0,
+                    total,
+                },
+            )
+            .ok();
             let mut transferred = 0;
             let download_result = download_tree(
                 &sftp,
@@ -2004,6 +2054,7 @@ async fn sftp_download_tree(
                 &cancel,
                 &app,
                 &mut transferred,
+                total,
             );
             match download_result {
                 Ok(()) => {
@@ -2145,21 +2196,21 @@ async fn sftp_chmod(
 
 #[tauri::command]
 fn cancel_transfer(transfer_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(cancel) = state
+    let mut transfers = state
         .transfers
         .lock()
-        .map_err(|_| "传输管理器已损坏".to_string())?
-        .get(&transfer_id)
-    {
-        cancel.store(true, Ordering::Relaxed);
-    }
+        .map_err(|_| "传输管理器已损坏".to_string())?;
+    transfers
+        .entry(transfer_id)
+        .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+        .store(true, Ordering::Relaxed);
     Ok(())
 }
 
 #[tauri::command]
-fn open_tool_window(request: ToolWindowRequest, app: AppHandle) -> Result<String, String> {
-    let page = match request.kind.as_str() {
-        "file-viewer" => "viewer.html",
+async fn open_tool_window(request: ToolWindowRequest, app: AppHandle) -> Result<String, String> {
+    match request.kind.as_str() {
+        "file-viewer" => (),
         _ => return Err("不支持的工具窗口类型".to_string()),
     };
     if request.query.len() > 16_384
@@ -2174,25 +2225,94 @@ fn open_tool_window(request: ToolWindowRequest, app: AppHandle) -> Result<String
     }
     let sequence = TOOL_WINDOW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let label = format!("tool-{}-{}-{sequence}", request.kind, request.scope_id);
-    let url = if request.query.is_empty() {
-        page.to_string()
-    } else {
-        format!("{page}?{}", request.query)
-    };
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
-        .title(request.title)
-        .inner_size(1050.0, 760.0)
-        .min_inner_size(680.0, 460.0)
-        .resizable(true)
-        .decorations(true)
-        .center()
-        .build()
-        .map_err(|error| format!("无法打开工具窗口：{error}"))?;
+    #[cfg(dev)]
+    let viewer_url = tauri::WebviewUrl::External(
+        tauri::Url::parse("http://127.0.0.1:1420/viewer.html")
+            .map_err(|error| format!("无法创建开发工具窗口地址：{error}"))?,
+    );
+    #[cfg(not(dev))]
+    let viewer_url = tauri::WebviewUrl::App("viewer.html".into());
+    app.state::<AppState>()
+        .tool_window_requests
+        .lock()
+        .map_err(|_| "工具窗口状态已损坏".to_string())?
+        .insert(label.clone(), request.clone());
+    let builder_app = app.clone();
+    let builder_label = label.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if let Err(error) = app.run_on_main_thread(move || {
+        let result = tauri::WebviewWindowBuilder::new(&builder_app, &builder_label, viewer_url)
+            .title(request.title)
+            .inner_size(1050.0, 760.0)
+            .min_inner_size(680.0, 460.0)
+            .resizable(true)
+            .decorations(false)
+            .devtools(true)
+            .center()
+            .build()
+            .map(|_| ())
+            .map_err(|error| format!("无法打开工具窗口：{error}"));
+        sender.send(result).ok();
+    }) {
+        if let Ok(mut requests) = app.state::<AppState>().tool_window_requests.lock() {
+            requests.remove(&label);
+        }
+        return Err(format!("无法调度工具窗口创建：{error}"));
+    }
+    let build_result = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "工具窗口创建超时".to_string())?;
+    if let Err(error) = build_result {
+        if let Ok(mut requests) = app.state::<AppState>().tool_window_requests.lock() {
+            requests.remove(&label);
+        }
+        return Err(error);
+    }
     Ok(label)
 }
 
 #[tauri::command]
-fn close_tool_windows(scope_id: Option<String>, force: bool, app: AppHandle) -> Result<(), String> {
+fn current_tool_window_request(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<ToolWindowRequest, String> {
+    state
+        .tool_window_requests
+        .lock()
+        .map_err(|_| "工具窗口状态已损坏".to_string())?
+        .get(window.label())
+        .cloned()
+        .ok_or_else(|| "找不到当前工具窗口参数".to_string())
+}
+
+#[tauri::command]
+fn close_current_tool_window(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .tool_window_requests
+        .lock()
+        .map_err(|_| "工具窗口状态已损坏".to_string())?
+        .remove(window.label());
+    window
+        .destroy()
+        .map_err(|error| format!("无法关闭工具窗口：{error}"))
+}
+
+#[tauri::command]
+fn open_current_devtools(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.open_devtools();
+    Ok(())
+}
+
+#[tauri::command]
+fn close_tool_windows(
+    scope_id: Option<String>,
+    force: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let scoped = scope_id.map(|scope| format!("-{scope}-"));
     for (label, window) in app.webview_windows() {
         if label.starts_with("tool-") && scoped.as_ref().is_none_or(|scope| label.contains(scope)) {
@@ -2207,6 +2327,14 @@ fn close_tool_windows(scope_id: Option<String>, force: bool, app: AppHandle) -> 
             }
         }
     }
+    state
+        .tool_window_requests
+        .lock()
+        .map_err(|_| "工具窗口状态已损坏".to_string())?
+        .retain(|label, _| {
+            !(label.starts_with("tool-")
+                && scoped.as_ref().is_none_or(|scope| label.contains(scope)))
+        });
     Ok(())
 }
 
@@ -2231,6 +2359,9 @@ fn update_tool_window_preferences(
     let normalized = ToolWindowPreferences {
         chunk_size: preferences.chunk_size.clamp(1024 * 1024, 64 * 1024 * 1024),
         edit_limit: preferences.edit_limit.clamp(1024 * 1024, 64 * 1024 * 1024),
+        wrap: preferences.wrap,
+        line_numbers: preferences.line_numbers,
+        font_size: preferences.font_size.clamp(10, 24),
     };
     for (label, window) in app.webview_windows() {
         if label.starts_with("tool-") {
@@ -2286,6 +2417,9 @@ pub fn run() {
             sftp_chmod,
             cancel_transfer,
             open_tool_window,
+            current_tool_window_request,
+            close_current_tool_window,
+            open_current_devtools,
             close_tool_windows,
             notify_tool_windows_closed,
             update_tool_window_preferences

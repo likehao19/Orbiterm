@@ -8,7 +8,7 @@ async function probeExistingServer() {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(800) });
     const html = await response.text();
-    return response.ok && html.includes("<title>Orbiterm</title>") && html.includes('src="/src/main.js"');
+    return response.ok && html.includes("<title>Orbiterm</title>") && html.includes('src="/src/entry.js"');
   } catch {
     return false;
   }
@@ -16,7 +16,10 @@ async function probeExistingServer() {
 
 if (await probeExistingServer()) {
   console.log(`Orbiterm 开发服务器已运行，复用 ${url}`);
-  process.exit(0);
+  while (await probeExistingServer()) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  console.log(`原开发服务器已退出，正在接管 ${url}`);
 }
 
 const server = await createServer();

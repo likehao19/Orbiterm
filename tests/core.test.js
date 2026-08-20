@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { allocateSessionId, appendRollingText, downloadTargetPath, duplicateBaseNames, escapeHtml, formatSize, isPreviewableTextFile, isRetryableSftpCommand, joinLocal, joinRemote, normalizeRemotePath, parentPath, safeFileName, sanitizeImportedSession } from "../src/core.js";
+import { allocateSessionId, appendRollingText, downloadTargetPath, duplicateBaseNames, escapeHtml, formatSize, isRetryableSftpCommand, joinLocal, joinRemote, normalizeRemotePath, parentPath, safeFileName, sanitizeImportedSession } from "../src/core.js";
 
 test("escapes untrusted HTML", () => {
   assert.equal(escapeHtml(`<img src=x onerror='bad'>`), "&lt;img src=x onerror=&#39;bad&#39;&gt;");
@@ -31,15 +31,6 @@ test("formats sizes and safe file names", () => {
 
 test("detects duplicate upload basenames", () => {
   assert.deepEqual(duplicateBaseNames(["C:\\a\\config.json", "C:\\b\\config.json", "C:\\b\\readme.md"]), ["config.json"]);
-});
-
-test("previews only supported text files", () => {
-  assert.equal(isPreviewableTextFile("server.log"), true);
-  assert.equal(isPreviewableTextFile("Dockerfile"), true);
-  assert.equal(isPreviewableTextFile("archive.tar"), false);
-  assert.equal(isPreviewableTextFile("archive.tar.gz"), false);
-  assert.equal(isPreviewableTextFile("program.exe"), false);
-  assert.equal(isPreviewableTextFile("unknown"), false);
 });
 
 test("keeps only the newest rolling log text", () => {

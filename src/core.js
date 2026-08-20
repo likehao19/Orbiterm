@@ -48,21 +48,6 @@ export function duplicateBaseNames(paths) {
   return [...duplicates];
 }
 
-const PREVIEWABLE_TEXT_EXTENSIONS = new Set([
-  "txt", "log", "md", "markdown", "json", "jsonl", "xml", "yaml", "yml", "toml",
-  "ini", "conf", "cfg", "properties", "env", "csv", "tsv", "sql", "sh", "bash", "zsh",
-  "fish", "ps1", "bat", "cmd", "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm",
-  "css", "scss", "less", "py", "pyw", "rs", "go", "java", "kt", "kts", "c", "cc", "cpp",
-  "h", "hpp", "cs", "php", "rb", "pl", "lua", "vue", "svelte", "gradle", "groovy",
-]);
-
-export function isPreviewableTextFile(name) {
-  const normalized = String(name).trim().toLowerCase();
-  if (["dockerfile", "makefile", "gemfile", "rakefile", "license", "readme"].includes(normalized)) return true;
-  const dot = normalized.lastIndexOf(".");
-  return dot > 0 && PREVIEWABLE_TEXT_EXTENSIONS.has(normalized.slice(dot + 1));
-}
-
 export function appendRollingText(current, addition, limit = 2_000_000) {
   const combined = `${current}${addition}`;
   return combined.length > limit ? combined.slice(-limit) : combined;
