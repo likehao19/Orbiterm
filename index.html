@@ -5,6 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/src-tauri/icons/32x32.png" />
     <title>Orbiterm</title>
+    <style>
+      html, body, #app { height: 100%; margin: 0; overflow: hidden; background: #07080a; color: #f7f8fb; }
+      html[data-app-theme="light"], html[data-app-theme="light"] body { background: #e8ecf1; color: #0c1118; }
+    </style>
+    <script>
+      try {
+        const saved = JSON.parse(localStorage.getItem("orbiterm.preferences.v1") || "{}");
+        const preference = saved.appTheme || "system";
+        const theme = preference === "system"
+          ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+          : preference;
+        document.documentElement.dataset.appTheme = theme;
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

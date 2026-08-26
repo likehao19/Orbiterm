@@ -659,6 +659,8 @@ async fn ssh_connect(
             channel
                 .request_pty(terminal, None, Some((request.cols, request.rows, 0, 0)))
                 .map_err(|error| format!("无法申请 PTY：{error}"))?;
+            let _ = channel.setenv("TERM", terminal);
+            let _ = channel.setenv("COLORTERM", "truecolor");
             if let Some(command) = request
                 .shell_command
                 .as_deref()
