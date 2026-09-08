@@ -207,22 +207,6 @@ const TERMINAL_SCHEMES = [
 
 const SCHEME_BY_ID = new Map(TERMINAL_SCHEMES.map((scheme) => [scheme.id, scheme]));
 
-function hexToRgb(hex) {
-  const value = String(hex || "").replace("#", "");
-  if (value.length < 6) return null;
-  return [
-    Number.parseInt(value.slice(0, 2), 16),
-    Number.parseInt(value.slice(2, 4), 16),
-    Number.parseInt(value.slice(4, 6), 16),
-  ];
-}
-
-function rgbAnsi(hex) {
-  const rgb = hexToRgb(hex);
-  if (!rgb) return "\x1b[39m";
-  return `\x1b[38;2;${rgb[0]};${rgb[1]};${rgb[2]}m`;
-}
-
 export function listTerminalSchemes() {
   return TERMINAL_SCHEMES;
 }
@@ -264,6 +248,7 @@ export function schemeToXtermTheme(scheme) {
     cursor: scheme.cursor,
     cursorAccent: scheme.cursorAccent || scheme.background,
     selectionBackground: scheme.selection,
+    selectionInactiveBackground: scheme.selection,
     selectionForeground: scheme.foreground,
   };
   XTERM_KEYS.forEach((key, index) => {
@@ -272,17 +257,16 @@ export function schemeToXtermTheme(scheme) {
   return theme;
 }
 
-export function schemeAnsiColors(scheme) {
-  const theme = schemeToXtermTheme(scheme);
+export function schemeAnsiColors() {
   return {
-    dim: rgbAnsi(theme.brightBlack),
-    green: rgbAnsi(theme.green),
-    cyan: rgbAnsi(theme.cyan),
-    blue: rgbAnsi(theme.blue),
-    amber: rgbAnsi(theme.yellow),
-    red: rgbAnsi(theme.red),
-    violet: rgbAnsi(theme.magenta),
-    bold: `\x1b[1m${rgbAnsi(theme.foreground)}`,
+    dim: "\x1b[90m",
+    green: "\x1b[32m",
+    cyan: "\x1b[36m",
+    blue: "\x1b[34m",
+    amber: "\x1b[33m",
+    red: "\x1b[31m",
+    violet: "\x1b[35m",
+    bold: "\x1b[1m",
     reset: "\x1b[0m",
   };
 }

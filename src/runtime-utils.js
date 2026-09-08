@@ -13,6 +13,30 @@ export function appendTextLines(lines, chunk) {
   return result;
 }
 
+export function findLimitedLineMatches(lines, query, limit = 5_000) {
+  const normalized = String(query).trim().toLowerCase();
+  if (!normalized) return { matches: [], truncated: false };
+  const matches = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!String(lines[index]).toLowerCase().includes(normalized)) continue;
+    if (matches.length >= limit) return { matches, truncated: true };
+    matches.push(index);
+  }
+  return { matches, truncated: false };
+}
+
+export function splitTrailingShellPrompt(text) {
+  const value = String(text);
+  const match = value.match(/(?:^|\r?\n|\r)[^\r\n]{0,160}[#$%>]\s*$/);
+  if (!match) return null;
+  const lineBreakLength = match[0].startsWith("\r\n") ? 2 : /^[\r\n]/.test(match[0]) ? 1 : 0;
+  const promptStart = match.index + lineBreakLength;
+  return {
+    before: value.slice(0, promptStart),
+    prompt: value.slice(promptStart),
+  };
+}
+
 export function normalizeImportedSessions(imported, existingIds, createId) {
   const existing = new Set(existingIds);
   return imported.flatMap((session) => {

@@ -1,17 +1,18 @@
 {
   "name": "orbiterm",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.4",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-server.mjs",
     "build": "vite build",
     "test": "node --test",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri.mjs"
   },
   "dependencies": {
     "@fontsource/jetbrains-mono": "^5.3.0",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",

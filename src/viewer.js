@@ -2,7 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../src-tauri/icons/32x32.png";
+import { renderViewerUi } from "./viewer-ui.js";
 import "./viewer.css";
+
+renderViewerUi();
 
 let injectedQuery = typeof window.__ORBITERM_VIEWER_QUERY__ === "string" ? window.__ORBITERM_VIEWER_QUERY__ : "";
 if (!injectedQuery && "__TAURI_INTERNALS__" in window) {
@@ -13,8 +16,8 @@ if (!injectedQuery) injectedQuery = location.search;
 const params = new URLSearchParams(injectedQuery);
 const sessionId = params.get("sessionId") || "";
 const path = params.get("path") || "";
-const name = params.get("name") || path.split("/").pop() || "远程文件";
 const english = params.get("language") === "en-US";
+const name = params.get("name") || path.split("/").pop() || (english ? "Remote file" : "远程文件");
 const isTauri = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauri ? getCurrentWindow() : {
   toggleMaximize: async () => {},
@@ -65,6 +68,21 @@ function setButtonLabel(button, zh, en) {
   const label = tr(zh, en);
   button.title = label;
   button.setAttribute("aria-label", label);
+}
+function localizeViewerUi() {
+  const text = (id, zh, en) => { el(id).textContent = tr(zh, en); };
+  el("findInput").placeholder = tr("查找内容", "Find in file");
+  text("loadingText", "正在读取远程文件…", "Reading remote file…");
+  text("status", "只读预览", "Read-only preview");
+  text("loadMore", "继续加载", "Load more");
+  text("saveFile", "保存到远端", "Save remotely");
+  text("confirmCloseTitle", "放弃修改", "Discard changes");
+  text("confirmCloseMessage", "文件有未保存的修改，确定放弃吗？", "This file has unsaved changes. Discard them?");
+  text("keepEditing", "继续编辑", "Keep editing");
+  text("discardChanges", "放弃并关闭", "Discard and close");
+  setButtonLabel(el("findPrevious"), "上一个", "Previous match");
+  setButtonLabel(el("findNext"), "下一个", "Next match");
+  setButtonLabel(el("closeFind"), "关闭", "Close");
 }
 function formatSize(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1024) return `${bytes || 0} B`;
@@ -287,6 +305,9 @@ if (isTauri) {
     el("status").textContent = tr("原终端会话已关闭，仅保留当前预览", "The terminal session is closed; the current preview is retained");
     showToast(tr("原终端会话已关闭", "The terminal session has been closed"));
   }).catch(() => {});
+  listen("orbiterm-app-theme", ({ payload }) => {
+    document.documentElement.dataset.theme = payload.theme === "dark" ? "dark" : "light";
+  }).catch(() => {});
   listen("orbiterm-tool-preferences", ({ payload }) => {
     fileChunkSize = Math.max(1024 * 1024, Math.min(64 * 1024 * 1024, Number(payload.chunkSize) || fileChunkSize));
     editSizeLimit = Math.max(1024 * 1024, Math.min(64 * 1024 * 1024, Number(payload.editLimit) || editSizeLimit));
@@ -323,6 +344,7 @@ document.addEventListener("keydown", (event) => {
   else if (event.key === "Escape" && !el("findBar").classList.contains("hidden")) el("findBar").classList.add("hidden");
 });
 
+localizeViewerUi();
 setButtonLabel(el("refreshFile"), "刷新", "Refresh");
 setButtonLabel(el("toggleEdit"), "编辑", "Edit");
 setButtonLabel(el("toggleWrap"), defaultWrapping ? "关闭自动换行" : "自动换行", defaultWrapping ? "Disable word wrap" : "Enable word wrap");

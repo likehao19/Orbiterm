@@ -1,12 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
+import { emit, emitTo, listen } from "@tauri-apps/api/event";
+import { availableMonitors, getCurrentWindow, Window } from "@tauri-apps/api/window";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { readText as readClipboardTextNative, writeText as writeClipboardTextNative } from "@tauri-apps/plugin-clipboard-manager";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
-import { appendTextLines, isTransientSftpError, normalizeImportedSessions } from "./runtime-utils.js";
+import { createBrowserController } from "./browser.js";
+import { appendTextLines, findLimitedLineMatches, isTransientSftpError, normalizeImportedSessions, splitTrailingShellPrompt } from "./runtime-utils.js";
 import { duplicateBaseNames, isRetryableSftpCommand } from "./core.js";
 import {
   DEFAULT_TERMINAL_SCHEME_ID,
@@ -25,12 +27,17 @@ import "@xterm/xterm/css/xterm.css";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-600.css";
 import "./styles.css";
-import "./theme-v2.css";
+import "./styles/v2-workspace.css";
+import "./styles/v2-tools.css";
+import "./styles/v2-dialogs.css";
+import "./styles/v2-refinements.css";
 
 const STORAGE_KEY = "orbiterm.sessions.v1";
 const DEFAULT_GROUP = "默认分组";
 const MAX_SPLIT = 7;
 const SPLIT_DRAG_THRESHOLD = 14;
+const TAIL_SEARCH_DEBOUNCE_MS = 160;
+const MAX_TAIL_SEARCH_MATCHES = 5_000;
 let fitVisibleTimer = 0;
 const PREFERENCES_KEY = "orbiterm.preferences.v1";
 const encoder = new TextEncoder();
@@ -38,17 +45,17 @@ const decoder = new TextDecoder();
 const DEFAULT_PREFERENCES = {
   fontSize: 13, terminalTheme: "dark", appTheme: "system", language: "zh-CN",
   cursorStyle: "bar", cursorBlink: true, scrollback: 10_000,
-  fontFamily: "jetbrains", lineHeight: 1.6, letterSpacing: 0, copyOnSelect: false,
-  rightClickAction: "menu", bellStyle: "none",
+  fontFamily: "jetbrains", lineHeight: 1.6, letterSpacing: 0, copyOnSelect: true,
+  rightClickAction: "paste", terminalClipboardVersion: 2, bellStyle: "none",
   confirmCloseSessions: true, restoreWindow: true, restoreTabs: false, defaultDrawer: "none",
   defaultTimeout: 20, keepaliveSeconds: 20, autoReconnectAttempts: 0, autoReconnectDelaySeconds: 3,
   previewWrap: false, previewLineNumbers: true, previewFontSize: 13,
   defaultDownloadDirectory: "", confirmOverwrite: true, showHiddenFiles: true, persistRemotePath: true,
   defaultLogDirectory: "", autoSessionLog: false, logFileTemplate: "{session}_{date}.log",
   tailDefaultLines: 100, tailRefreshMs: 2000,
-  recentSessionIds: [], lastOpenSessionIds: [], remotePathsBySession: {}, windowBounds: null, windowBoundsVersion: 2,
+  lastOpenSessionIds: [], remotePathsBySession: {}, windowBounds: null, windowBoundsVersion: 2,
   sessionGroups: [], collapsedGroups: [],
-  sftpWidth: 540, tailWidth: 620, manualWidth: 760, confirmMultiLinePaste: true,
+  sftpWidth: 540, tailWidth: 540, manualWidth: 540, confirmMultiLinePaste: true,
   uploadWorkers: 3, downloadWorkers: 4, tailMaxLines: 200_000, tailAllLimitMb: 64,
   fileChunkSizeMb: 4, fileEditLimitMb: 32, sftpPageSize: 500, sftpFilterDebounceMs: 120,
 };
@@ -61,6 +68,17 @@ const terminalFontFamilies = {
 let commandOptions = {};
 let commandOptionsPromise = null;
 const isTauri = "__TAURI_INTERNALS__" in window;
+const detachedSftp = window.__ORBITERM_SFTP_REQUEST__ || null;
+const detachedSftpWindows = new Map();
+let browserController = null;
+
+function readClipboardText() {
+  return isTauri ? readClipboardTextNative() : navigator.clipboard.readText();
+}
+
+function writeClipboardText(text) {
+  return isTauri ? writeClipboardTextNative(text) : navigator.clipboard.writeText(text);
+}
 const appWindow = isTauri
   ? getCurrentWindow()
   : {
@@ -116,6 +134,8 @@ const state = {
   tailSearchIndex: -1,
   tailSearchMatches: [],
   tailSearchQuery: "",
+  tailSearchTruncated: false,
+  tailSearchTimer: null,
   tailRenderFrame: null,
   remoteEntries: [],
   remoteFilter: "",
@@ -237,8 +257,38 @@ function colorizeClientOutput(record, text) {
   if (leftAlt) record.altScreen = false;
   if (record.altScreen || enteredAlt) return text;
   if (text.length < 4 && !/[\r\n]/.test(text)) return text;
-  const c = schemeAnsiColors(currentTerminalScheme());
+  const c = schemeAnsiColors();
   return text.split(/(\r\n|\n|\r)/).map((part, index) => (index % 2 ? part : colorizeOutputLine(part, c))).join("");
+}
+
+function flushColorizedOutput(record) {
+  clearTimeout(record.colorizeTimer);
+  record.colorizeTimer = null;
+  const text = record.colorizePending;
+  record.colorizePending = "";
+  if (text) record.terminal.write(colorizeClientOutput(record, text));
+}
+
+function writeColorizedOutput(record, text) {
+  if (!text) return;
+  // Echo and full-screen control sequences must not wait for a complete line.
+  if (performance.now() < record.interactiveUntil || record.altScreen || ALT_SCREEN_ON.test(text)) {
+    record.colorizePending += text;
+    flushColorizedOutput(record);
+    return;
+  }
+  clearTimeout(record.colorizeTimer);
+  record.colorizeTimer = null;
+  const combined = record.colorizePending + text;
+  record.colorizePending = "";
+  const lastLineBreak = Math.max(combined.lastIndexOf("\n"), combined.lastIndexOf("\r"));
+  if (lastLineBreak >= 0) {
+    record.terminal.write(colorizeClientOutput(record, combined.slice(0, lastLineBreak + 1)));
+  }
+  record.colorizePending = combined.slice(lastLineBreak + 1);
+  if (record.colorizePending) {
+    record.colorizeTimer = setTimeout(() => flushColorizedOutput(record), 40);
+  }
 }
 
 const linuxCommands = [
@@ -276,84 +326,6 @@ document.querySelector("#app").innerHTML = `
         <span class="grow">搜索工作区、会话与命令…</span>
         <kbd class="chip">Ctrl</kbd><kbd class="chip">K</kbd>
       </button>
-      <nav class="menubar app-menubar" aria-label="应用菜单">
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">文件</button>
-        <div class="menu-popup">
-          <button data-menu-action="new-session"><span>新建 SSH 会话</span><kbd>Ctrl+Shift+T</kbd></button>
-          <button data-menu-action="quick-connect"><span>快速连接</span></button>
-          <button data-menu-action="local-ssh"><span>新建本地 PowerShell</span></button>
-          <div id="recentSessionsMenu" class="menu-section"></div>
-          <i></i>
-          <button data-menu-action="import-sessions"><span>导入会话配置</span></button>
-          <button data-menu-action="export-sessions"><span>导出会话配置</span></button>
-          <i></i>
-          <button data-menu-action="exit"><span>退出 Orbiterm</span><kbd>Alt+F4</kbd></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">编辑</button>
-        <div class="menu-popup">
-          <button data-menu-action="copy"><span>复制</span><kbd>Ctrl+Shift+C</kbd></button>
-          <button data-menu-action="paste"><span>粘贴</span><kbd>Ctrl+Shift+V</kbd></button>
-          <i></i>
-          <button data-menu-action="select-all"><span>全选终端内容</span><kbd>Ctrl+Shift+A</kbd></button>
-          <button data-menu-action="find"><span>查找终端内容</span><kbd>Ctrl+Shift+G</kbd></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">查看</button>
-        <div class="menu-popup">
-          <button data-menu-action="toggle-sidebar"><span>会话管理器</span><kbd>Ctrl+B</kbd></button>
-          <button data-menu-action="toggle-sftp"><span>SFTP 文件管理器</span><kbd>Ctrl+Shift+F</kbd></button>
-          <button data-menu-action="toggle-tail"><span>Tail 日志查看</span></button>
-          <button data-menu-action="toggle-manual"><span>Linux 命令手册面板</span></button>
-          <i></i>
-          <button data-menu-action="fullscreen"><span>全屏</span><kbd>F11</kbd></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">终端</button>
-        <div class="menu-popup">
-          <button data-menu-action="duplicate-terminal"><span>复制当前标签</span></button>
-          <button data-menu-action="previous-terminal"><span>上一个标签</span><kbd>Ctrl+PgUp</kbd></button>
-          <button data-menu-action="next-terminal"><span>下一个标签</span><kbd>Ctrl+PgDn</kbd></button>
-          <i></i>
-          <button data-menu-action="disconnect"><span>断开当前连接</span></button>
-          <button data-menu-action="reconnect"><span>重新连接</span></button>
-          <button data-menu-action="reset-terminal"><span>重置终端</span></button>
-          <button data-menu-action="clear"><span>清除屏幕</span></button>
-          <i></i>
-          <button data-menu-action="toggle-log"><span>开始/停止命令记录</span></button>
-          <button data-menu-action="close-terminal"><span>关闭当前标签</span><kbd>Ctrl+Shift+W</kbd></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">工具</button>
-        <div class="menu-popup">
-          <button data-menu-action="transfer-tasks"><span>传输任务</span></button>
-          <button data-menu-action="upload"><span>上传文件到当前目录</span></button>
-          <i></i>
-          <button data-menu-action="toggle-log"><span>开始/停止命令记录</span></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">设置</button>
-        <div class="menu-popup">
-          <button data-menu-action="settings"><span>应用设置</span></button>
-        </div>
-      </div>
-      <div class="menu-root">
-        <button class="menu-trigger" aria-haspopup="menu" aria-expanded="false">帮助</button>
-        <div class="menu-popup">
-          <button data-menu-action="guide"><span>使用说明</span></button>
-          <button data-menu-action="command-manual"><span>Linux 命令手册</span></button>
-          <button data-menu-action="shortcuts"><span>快捷键说明</span></button>
-          <i></i>
-          <button data-menu-action="about"><span>关于 Orbiterm</span></button>
-        </div>
-      </div>
-      </nav>
       <div class="win-controls window-actions">
         <button id="bellBtn" class="bell-btn" type="button" title="通知">
           ${ic('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>')}
@@ -388,10 +360,11 @@ document.querySelector("#app").innerHTML = `
           <button class="icon-btn" id="sidebarKeys" title="凭据">${ic('<circle cx="8" cy="15" r="4"/><path d="m11 12 8.5-8.5M17 5l2.5 2.5M14 8l2 2"/>')}</button>
           <button class="icon-btn" id="sidebarFingerprint" title="主机指纹">${ic('<path d="M12 22s8-3.6 8-10V5l-8-3-8 3v7c0 6.4 8 10 8 10z"/><path d="m9 11.5 2 2 4-4"/>')}</button>
           <button class="icon-btn" id="themeToggle" title="切换亮色 / 深色">${ic('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>')}</button>
-          <span class="ver">0.1.0</span>
+          <span class="ver">0.1.4</span>
         </div>
       </aside>
-      <section class="terminal-pane">
+      <section class="terminal-pane terminal-empty">
+        <button class="icon-btn empty-sidebar-toggle" id="expandEmptySidebar" title="展开会话管理器" aria-label="展开会话管理器">${ic('<path d="m10 6 6 6-6 6"/>')}</button>
         <div class="ws-topbar">
           <button class="icon-btn expand-btn" id="expandSidebar" title="展开侧栏">${ic('<path d="m10 6 6 6-6 6"/>')}</button>
           <span class="crumb">
@@ -407,7 +380,7 @@ document.querySelector("#app").innerHTML = `
             <button class="icon-btn" id="openManualTool" title="命令手册">${ic('<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>')}</button>
             <div class="vline"></div>
             <button class="icon-btn" id="reconnectTool" title="重新连接">${ic('<path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/>')}</button>
-            <button class="icon-btn" id="moreTool" title="更多">${ic('<circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/>')}</button>
+            <button class="icon-btn" id="openBrowserTool" title="内置浏览器" aria-label="内置浏览器" aria-expanded="false">${ic('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18z"/>')}</button>
           </div>
           <div id="terminalTabs" class="tabs"></div>
         </div>
@@ -423,14 +396,16 @@ document.querySelector("#app").innerHTML = `
             </div>
             <section id="pastePanel" class="paste-panel hidden"><div><strong>多行粘贴</strong><small id="pasteSummary"></small><button id="closePastePanel">×</button></div><textarea id="pasteEditor" spellcheck="false"></textarea><footer><label class="paste-join-lines" title="可选：把多行内容合并为一行后发送"><input id="pasteJoinLines" type="checkbox" /> 合并换行为空格</label><button id="copyPasteText">复制</button><button id="sendPasteText" class="primary">发送到终端</button></footer></section>
           </div>
+      <aside id="browserPanel" class="browser-panel hidden" aria-label="内置浏览器"></aside>
       <aside id="sftpPanel" class="sftp-panel hidden" aria-label="SFTP 文件管理器">
         <div id="sftpResize" class="sftp-resize" title="拖动调整宽度"></div>
-        <div class="sftp-head"><span><strong>远程文件</strong><small id="sftpHost">未连接</small></span><button id="closeSftp" title="关闭文件管理器" aria-label="关闭文件管理器">×</button></div>
+        <div class="sftp-head"><span><strong>远程文件</strong><small id="sftpHost">未连接</small></span><button id="detachSftp" title="在独立窗口打开" aria-label="在独立窗口打开">${ic('<path d="M14 3h7v7M21 3l-9 9"/><path d="M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/>')}</button><button id="closeSftp" title="关闭文件管理器" aria-label="关闭文件管理器">×</button></div>
         <div class="sftp-commandbar"><button id="uploadFile" class="accent" title="上传多个文件">↑ 上传</button><button id="downloadFile" disabled>↓ 下载</button><div class="new-remote"><button id="newRemote" aria-haspopup="menu">＋ 新建</button><div id="newRemoteMenu" class="new-remote-menu hidden"><button data-new-remote="file">新建文件</button><button data-new-remote="folder">新建文件夹</button></div></div><div class="sftp-filter"><span>⌕</span><input id="remoteFilter" placeholder="筛选当前目录" aria-label="筛选当前目录" /><button id="clearRemoteFilter" class="hidden" title="清除筛选">×</button></div><span id="remoteSummary">0 项</span></div>
         <div class="sftp-nav"><button id="remoteBack" title="后退" aria-label="后退">‹</button><button id="remoteForward" title="前进" aria-label="前进">›</button><button id="remoteUp" title="上一级" aria-label="上一级">↑</button><div class="sftp-address"><span>⌂</span><input id="remotePath" value="/" aria-label="远程路径" /><button id="copyRemotePath" title="复制路径" aria-label="复制路径">⧉</button></div><button id="remoteRefresh" title="刷新" aria-label="刷新">↻</button></div>
         <div class="file-header"><button data-sort="name">名称 <i></i></button><button data-sort="size">大小 <i></i></button><button data-sort="owner">归属用户 <i></i></button><button data-sort="modified">修改时间 <i></i></button><button data-sort="permissions">权限 <i></i></button></div>
         <div id="remoteFiles" class="remote-files"><div class="file-placeholder">连接后可浏览远程文件</div></div>
         <section id="transferTasks" class="transfer-tasks hidden" aria-label="传输任务">
+          <div id="transferResize" class="transfer-resize" role="separator" aria-label="调整传输区域高度" aria-orientation="horizontal" tabindex="0"></div>
           <header><strong>传输任务</strong><small id="transferTaskCount"></small><button id="clearTransferTasks">清除已完成</button></header>
           <div id="transferTaskList" class="transfer-task-list"></div>
         </section>
@@ -559,7 +534,7 @@ document.querySelector("#app").innerHTML = `
             <button type="button" class="theme-picker-card" data-app-theme-choice="light"><span class="theme-preview-mock theme-preview-light"><span></span><i></i></span><strong>浅色</strong></button>
             <button type="button" class="theme-picker-card" data-app-theme-choice="dark"><span class="theme-preview-mock theme-preview-dark"><span></span><i></i></span><strong>深色</strong></button>
           </div></div><div class="field full"><label id="languageSettingLabel" for="languageSetting">界面语言</label><select id="languageSetting"><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></div></div></section>
-          <section class="settings-page" data-settings-panel="terminal"><h2 id="terminalSettingsTitle">终端</h2><div class="settings-section"><h3 id="terminalSchemeGroupTitle">配色</h3><div class="field full theme-setting-field"><label id="terminalThemeLabel">终端配色</label><input id="terminalSchemeSetting" type="hidden" /><div id="terminalSchemePicker" class="scheme-picker" role="listbox" aria-labelledby="terminalSchemeGroupTitle" aria-orientation="vertical"></div></div></div><div class="settings-section"><h3 id="terminalDisplayGroupTitle">显示与行为</h3><div class="field full"><label for="fontFamilySetting">终端字体</label><select id="fontFamilySetting"><option value="cascadia">Cascadia Code</option><option value="jetbrains">JetBrains Mono</option><option value="consolas">Consolas</option><option value="monospace">系统等宽字体</option></select></div><div class="form-grid"><div class="field"><label id="fontSizeLabel" for="fontSizeSetting">字体大小</label><input id="fontSizeSetting" type="number" min="10" max="32" /></div><div class="field"><label for="lineHeightSetting">行高</label><input id="lineHeightSetting" type="number" min="1" max="2" step="0.05" /></div></div><div class="field full"><label for="letterSpacingSetting">字符间距</label><input id="letterSpacingSetting" type="number" min="-1" max="5" step="0.25" /></div><div class="field full"><label id="cursorStyleLabel" for="cursorStyleSetting">光标样式</label><select id="cursorStyleSetting"><option value="block">方块</option><option value="bar">竖线</option><option value="underline">下划线</option></select></div><label id="cursorBlinkLabel" class="save-session"><input id="cursorBlinkSetting" type="checkbox" /> <span>光标闪烁</span></label><label class="save-session"><input id="copyOnSelectSetting" type="checkbox" /> <span>选中文本后自动复制</span></label><div class="field full"><label for="rightClickActionSetting">终端右键行为</label><select id="rightClickActionSetting"><option value="menu">打开右键菜单</option><option value="paste">直接粘贴</option></select></div><div class="field full"><label for="bellStyleSetting">终端响铃</label><select id="bellStyleSetting"><option value="none">关闭</option><option value="visual">视觉提示</option><option value="sound">声音</option></select></div><div class="field full"><label id="scrollbackLabel" for="scrollbackSetting">回滚缓冲行数</label><input id="scrollbackSetting" type="number" min="1000" max="100000" step="1000" /><small>默认 10,000 行，数值越大占用内存越多</small></div><label id="confirmPasteLabel" class="save-session"><input id="confirmPasteSetting" type="checkbox" /> <span>粘贴多行文本前确认</span></label></div></section>
+          <section class="settings-page" data-settings-panel="terminal"><h2 id="terminalSettingsTitle">终端</h2><div class="settings-section"><h3 id="terminalSchemeGroupTitle">配色</h3><div class="field full theme-setting-field"><label id="terminalThemeLabel">终端配色</label><input id="terminalSchemeSetting" type="hidden" /><div id="terminalSchemePicker" class="scheme-picker" role="listbox" aria-labelledby="terminalSchemeGroupTitle" aria-orientation="vertical"></div></div></div><div class="settings-section"><h3 id="terminalDisplayGroupTitle">显示与行为</h3><div class="field full"><label for="fontFamilySetting">终端字体</label><select id="fontFamilySetting"><option value="cascadia">Cascadia Code</option><option value="jetbrains">JetBrains Mono</option><option value="consolas">Consolas</option><option value="monospace">系统等宽字体</option></select></div><div class="form-grid"><div class="field"><label id="fontSizeLabel" for="fontSizeSetting">字体大小</label><input id="fontSizeSetting" type="number" min="10" max="32" /></div><div class="field"><label for="lineHeightSetting">行高</label><input id="lineHeightSetting" type="number" min="1" max="2" step="0.05" /></div></div><div class="field full"><label for="letterSpacingSetting">字符间距</label><input id="letterSpacingSetting" type="number" min="-1" max="5" step="0.25" /></div><div class="field full"><label id="cursorStyleLabel" for="cursorStyleSetting">光标样式</label><select id="cursorStyleSetting"><option value="block">方块</option><option value="bar">竖线</option><option value="underline">下划线</option></select></div><label id="cursorBlinkLabel" class="save-session"><input id="cursorBlinkSetting" type="checkbox" /> <span>光标闪烁</span></label><label class="save-session"><input id="copyOnSelectSetting" type="checkbox" /> <span>选中文本后自动复制</span></label><div class="field full"><label for="rightClickActionSetting">终端右键行为</label><select id="rightClickActionSetting"><option value="paste">直接粘贴</option><option value="menu">打开右键菜单</option></select></div><div class="field full"><label for="bellStyleSetting">终端响铃</label><select id="bellStyleSetting"><option value="none">关闭</option><option value="visual">视觉提示</option><option value="sound">声音</option></select></div><div class="field full"><label id="scrollbackLabel" for="scrollbackSetting">回滚缓冲行数</label><input id="scrollbackSetting" type="number" min="1000" max="100000" step="1000" /><small>默认 10,000 行，数值越大占用内存越多</small></div><label id="confirmPasteLabel" class="save-session"><input id="confirmPasteSetting" type="checkbox" /> <span>粘贴多行文本前确认</span></label></div></section>
           <section class="settings-page" data-settings-panel="connection"><h2>连接</h2><div class="settings-section"><div class="field full"><label for="defaultTimeoutSetting">新连接默认超时</label><div class="setting-number-unit"><input id="defaultTimeoutSetting" type="number" min="1" max="300" /><span>秒</span></div></div><div class="field full"><label for="keepaliveSetting">SSH Keepalive 间隔</label><div class="setting-number-unit"><input id="keepaliveSetting" type="number" min="5" max="300" /><span>秒</span></div></div><div class="field full"><label for="autoReconnectAttemptsSetting">断线自动重连次数</label><input id="autoReconnectAttemptsSetting" type="number" min="0" max="10" /><small>0 表示关闭自动重连</small></div><div class="field full"><label for="autoReconnectDelaySetting">自动重连间隔</label><div class="setting-number-unit"><input id="autoReconnectDelaySetting" type="number" min="1" max="60" /><span>秒</span></div></div></div></section>
           <section class="settings-page" data-settings-panel="files"><h2>文件与预览</h2><div class="settings-section"><label class="save-session"><input id="previewWrapSetting" type="checkbox" /> <span>文件预览默认自动换行</span></label><label class="save-session"><input id="previewLineNumbersSetting" type="checkbox" /> <span>文件预览默认显示行号</span></label><div class="field full"><label for="previewFontSizeSetting">文件预览字体大小</label><input id="previewFontSizeSetting" type="number" min="10" max="24" /></div><div class="field full"><label for="defaultDownloadDirectorySetting">默认下载目录</label><div class="input-action"><input id="defaultDownloadDirectorySetting" placeholder="留空时每次询问" /><button id="pickDownloadDirectory" type="button">浏览</button></div></div><label class="save-session"><input id="confirmOverwriteSetting" type="checkbox" /> <span>覆盖同名远程文件前确认</span></label><label class="save-session"><input id="showHiddenFilesSetting" type="checkbox" /> <span>显示以点开头的隐藏文件</span></label><label class="save-session"><input id="persistRemotePathSetting" type="checkbox" /> <span>记住每个会话最后访问的远程目录</span></label></div></section>
           <section class="settings-page" data-settings-panel="logging"><h2>日志</h2><div class="settings-section"><div class="field full"><label for="defaultLogDirectorySetting">默认日志目录</label><div class="input-action"><input id="defaultLogDirectorySetting" placeholder="留空时每次询问" /><button id="pickLogDirectory" type="button">浏览</button></div></div><label class="save-session"><input id="autoSessionLogSetting" type="checkbox" /> <span>SSH 连接成功后自动记录终端日志</span></label>
@@ -647,7 +622,7 @@ function normalizePreferences(preferences = {}) {
     lineHeight: boundedNumber(merged.lineHeight, 1.6, 1, 2, false),
     letterSpacing: boundedNumber(merged.letterSpacing, 0, -1, 5, false),
     copyOnSelect: Boolean(merged.copyOnSelect),
-    rightClickAction: ["menu", "paste"].includes(merged.rightClickAction) ? merged.rightClickAction : "menu",
+    rightClickAction: ["menu", "paste"].includes(merged.rightClickAction) ? merged.rightClickAction : "paste",
     bellStyle: ["none", "visual", "sound"].includes(merged.bellStyle) ? merged.bellStyle : "none",
     confirmCloseSessions: Boolean(merged.confirmCloseSessions),
     restoreWindow: Boolean(merged.restoreWindow),
@@ -669,7 +644,6 @@ function normalizePreferences(preferences = {}) {
     logFileTemplate: typeof merged.logFileTemplate === "string" && merged.logFileTemplate.trim() ? merged.logFileTemplate.trim() : DEFAULT_PREFERENCES.logFileTemplate,
     tailDefaultLines: boundedNumber(merged.tailDefaultLines, 100, 1, 100_000),
     tailRefreshMs: boundedNumber(merged.tailRefreshMs, 2_000, 250, 30_000),
-    recentSessionIds: Array.isArray(merged.recentSessionIds) ? merged.recentSessionIds.filter((id) => typeof id === "string").slice(0, 8) : [],
     lastOpenSessionIds: Array.isArray(merged.lastOpenSessionIds) ? merged.lastOpenSessionIds.filter((id) => typeof id === "string") : [],
     sessionGroups: Array.isArray(merged.sessionGroups) ? merged.sessionGroups.filter((name) => typeof name === "string" && name.trim()).map((name) => name.trim()) : [],
     collapsedGroups: Array.isArray(merged.collapsedGroups) ? merged.collapsedGroups.filter((name) => typeof name === "string") : [],
@@ -708,6 +682,11 @@ function loadPreferences() {
       if (saved.lineHeight == null || Number(saved.lineHeight) === 1.5 || Number(saved.lineHeight) === 1.18) migrated.lineHeight = 1.6;
       migrated.terminalChromeVersion = 4;
     }
+    if ((saved.terminalClipboardVersion || 0) < 2) {
+      migrated.copyOnSelect = true;
+      migrated.rightClickAction = "paste";
+      migrated.terminalClipboardVersion = 2;
+    }
     return normalizePreferences(migrated);
   } catch {
     return normalizePreferences({ terminalThemeDefaultVersion: 2, terminalChromeVersion: 4 });
@@ -731,10 +710,20 @@ function terminalThemeName() {
 
 function applyTerminalSchemeCss(node) {
   const theme = currentXtermTheme();
+  const chrome = terminalChromeOptions();
   node.style.setProperty("--term-bg", theme.background);
   node.style.setProperty("--term-fg", theme.foreground);
   node.style.setProperty("--term-cursor", theme.cursor);
-  node.style.setProperty("--term-font-size", `${state.preferences.fontSize}px`);
+  node.style.setProperty("--term-selection", theme.selectionBackground);
+  [
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "brightBlack", "brightRed", "brightGreen", "brightYellow",
+    "brightBlue", "brightMagenta", "brightCyan", "brightWhite",
+  ].forEach((key, index) => node.style.setProperty(`--term-ansi-${index}`, theme[key]));
+  node.style.setProperty("--term-font-family", chrome.fontFamily);
+  node.style.setProperty("--term-font-size", `${chrome.fontSize}px`);
+  node.style.setProperty("--term-font-weight", chrome.fontWeight);
+  node.style.setProperty("--term-font-weight-bold", chrome.fontWeightBold);
   node.dataset.termTheme = currentSchemeTone();
 }
 
@@ -783,17 +772,19 @@ function applyTerminalChrome(record) {
 }
 
 function savePreferences() {
+  if (detachedSftp) return;
   localStorage.setItem(PREFERENCES_KEY, JSON.stringify(state.preferences));
   applyAppAppearance();
   state.terminals.forEach((record) => {
     applyTerminalChrome(record);
     record.terminal.options.scrollback = state.preferences.scrollback;
     record.terminal.options.bellStyle = state.preferences.bellStyle === "sound" ? "sound" : "none";
-    requestAnimationFrame(() => record.fit.fit());
+    requestAnimationFrame(() => fitTerminalRecord(record));
   });
 }
 
 async function captureWindowBounds() {
+  if (detachedSftp) return;
   if (!isTauri || state.restoringWindowBounds || !state.preferences.restoreWindow
     || await appWindow.isMinimized() || await appWindow.isMaximized() || await appWindow.isFullscreen()) return;
   const [position, size] = await Promise.all([appWindow.innerPosition(), appWindow.innerSize()]);
@@ -885,7 +876,9 @@ function applyAppAppearance() {
   if (theme === "light") document.documentElement.dataset.theme = "light";
   else delete document.documentElement.dataset.theme;
   document.documentElement.lang = state.preferences.language === "en-US" ? "en" : "zh-CN";
+  if (isTauri && !detachedSftp) void emit("orbiterm-app-theme", { theme }).catch(() => {});
   applyInterfaceLanguage();
+  browserController?.localize();
   if (typeof updateActiveStatus === "function") updateActiveStatus();
 }
 
@@ -908,26 +901,6 @@ function setSidebarCollapsed(collapsed) {
 
 function persistSessions() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state.sessions));
-}
-
-function renderRecentSessions() {
-  const container = el("recentSessionsMenu");
-  if (!container) return;
-  const sessions = state.preferences.recentSessionIds.map((id) => state.sessions.find((session) => session.id === id)).filter(Boolean);
-  if (!sessions.length) { container.innerHTML = ""; return; }
-  container.innerHTML = `<i></i><small>${tr("最近连接", "Recent connections")}</small>${sessions.map((session) => `<button type="button" data-recent-session="${escapeHtml(session.id)}"><span>${escapeHtml(session.name)}</span><kbd>${escapeHtml(session.host)}</kbd></button>`).join("")}`;
-  container.querySelectorAll("[data-recent-session]").forEach((button) => button.addEventListener("click", () => {
-    closeMenus();
-    const session = state.sessions.find((item) => item.id === button.dataset.recentSession);
-    if (session) void connectSavedSession(session);
-  }));
-}
-
-function rememberRecentSession(session) {
-  if (!state.sessions.some((item) => item.id === session.id)) return;
-  state.preferences.recentSessionIds = [session.id, ...state.preferences.recentSessionIds.filter((id) => id !== session.id)].slice(0, 8);
-  savePreferences();
-  renderRecentSessions();
 }
 
 function persistOpenSessionIds() {
@@ -966,6 +939,7 @@ function finishTerminalBootstrap(record, chunk) {
     record.bootstrapInstalling = false;
     record.bootstrapInstalled = true;
     record.bootstrapBuffer = new Uint8Array();
+    record.bootstrapHiddenPrompt = "";
     const echoedCommandIndex = byteIndex(combined, BOOTSTRAP_ECHO_PREFIX);
     if (echoedCommandIndex < 0) {
       const suffix = combined.slice(markerIndex + BOOTSTRAP_MARKER.length);
@@ -986,26 +960,32 @@ function finishTerminalBootstrap(record, chunk) {
   return new Uint8Array();
 }
 
-async function installCwdIntegration(record) {
-  if (!record.connected || record.bootstrapInstalled || record.bootstrapInstalling || !record.bootstrapWanted) return;
+async function installCwdIntegration(record, clearVisiblePrompt = true) {
+  if (!record.connected || record.bootstrapInstalled || record.bootstrapInstalling || record.bootstrapAttempted || !record.bootstrapWanted) return;
+  record.bootstrapAttempted = true;
   record.bootstrapInstalling = true;
   record.bootstrapPending = true;
   // The shell prints a fresh prompt after installing the hook. Clear only the
   // currently visible prompt line first so it is not shown twice.
-  record.terminal.write("\r\x1b[2K");
-  clearTimeout(record.bootstrapFallbackTimer);
-  record.bootstrapFallbackTimer = null;
+  if (clearVisiblePrompt) record.terminal.write("\r\x1b[2K");
   const integration = "if [ -n \"$BASH_VERSION\" ]; then __orbiterm_cwd(){ printf '\\033]7;file://%s%s\\033\\\\' \"$HOSTNAME\" \"$PWD\"; }; PROMPT_COMMAND=\"__orbiterm_cwd$([ -n \"$PROMPT_COMMAND\" ] && printf ';%s' \"$PROMPT_COMMAND\")\"; elif [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __orbiterm_cwd(){ printf '\\033]7;file://%s%s\\033\\\\' \"$HOST\" \"$PWD\"; }; add-zsh-hook precmd __orbiterm_cwd 2>/dev/null; fi; printf '\\033]777;orbiterm-ready\\007'\n";
   await invoke("ssh_write", { id: record.id, data: Array.from(encoder.encode(integration)) }).catch(() => {
     record.bootstrapPending = false;
     record.bootstrapInstalling = false;
+    if (record.bootstrapHiddenPrompt) {
+      record.terminal.write(colorizeClientOutput(record, record.bootstrapHiddenPrompt));
+      record.bootstrapHiddenPrompt = "";
+    }
   });
   record.bootstrapTimer = setTimeout(() => {
     if (!record.bootstrapPending) return;
     record.bootstrapPending = false;
     record.bootstrapInstalling = false;
-    record.terminal.write(colorizeClientOutput(record, new TextDecoder().decode(record.bootstrapBuffer)));
+    // A failed bootstrap must never expose or retry Orbiterm's internal shell command.
+    // Restore the prompt that was hidden before injection instead.
+    record.terminal.write(colorizeClientOutput(record, record.bootstrapHiddenPrompt));
     record.bootstrapBuffer = new Uint8Array();
+    record.bootstrapHiddenPrompt = "";
   }, 2000);
 }
 
@@ -1288,7 +1268,7 @@ function commandOptionDescriptionEnglish(base, item) {
   return `Use ${item.option} with ${base}. See the example for the expected syntax.`;
 }
 
-function appPrompt({ title, message = "", value = "", input = true, confirmText = "确定", options = null }) {
+function appPrompt({ title, message = "", value = "", input = true, confirmText = null, options = null }) {
   return new Promise((resolve) => {
     const root = el("appPrompt");
     const selectMode = Array.isArray(options) && options.length > 0;
@@ -1303,7 +1283,7 @@ function appPrompt({ title, message = "", value = "", input = true, confirmText 
     select.classList.toggle("hidden", !selectMode);
     select.replaceChildren(...(options || []).map((option) => new Option(option, option)));
     if (selectMode) select.value = options.includes(value) ? value : options[0];
-    el("appPromptConfirm").textContent = localizeRuntimeText(confirmText);
+    el("appPromptConfirm").textContent = localizeRuntimeText(confirmText || tr("确定", "OK"));
     el("appPromptCancel").textContent = tr("取消", "Cancel");
     const finish = (result) => {
       root.classList.add("hidden");
@@ -1453,7 +1433,6 @@ function renderSessions() {
       </article>`).join("")}</div></section>`;
     }).join("")
     : `<div class="no-sessions"><p>${query ? (english ? "No matching sessions" : "没有匹配的会话") : (english ? "No saved sessions. Create a group or a session to get started." : "还没有保存的会话，可先新建分组或会话")}</p></div>`;
-  renderRecentSessions();
   refreshNotifyBadge();
 }
 
@@ -1812,16 +1791,6 @@ function applyInterfaceLanguage() {
   renderSessions();
   const text = (selector, zh, en) => { const node = document.querySelector(selector); if (node) node.textContent = english ? en : zh; };
   const title = (selector, zh, en) => { const node = document.querySelector(selector); if (node) { node.title = english ? en : zh; node.setAttribute("aria-label", english ? en : zh); } };
-  const menuLabels = [
-    ["文件", "File"], ["编辑", "Edit"], ["查看", "View"], ["终端", "Terminal"], ["工具", "Tools"], ["设置", "Settings"], ["帮助", "Help"],
-  ];
-  document.querySelectorAll(".menu-trigger").forEach((node, index) => { if (menuLabels[index]) node.textContent = english ? menuLabels[index][1] : menuLabels[index][0]; });
-  document.querySelector(".menubar")?.setAttribute("aria-label", english ? "Application menu" : "应用菜单");
-  const actions = {
-    "new-session": ["新建 SSH 会话", "New SSH Session"], "quick-connect": ["快速连接", "Quick Connect"], "local-ssh": ["新建本地 PowerShell", "New Local PowerShell"], "import-sessions": ["导入会话配置", "Import Sessions"], "export-sessions": ["导出会话配置", "Export Sessions"], exit: ["退出 Orbiterm", "Exit Orbiterm"],
-    copy: ["复制", "Copy"], paste: ["粘贴", "Paste"], "select-all": ["全选终端内容", "Select All"], find: ["查找终端内容", "Find"], "toggle-sidebar": ["会话管理器", "Session Manager"], "toggle-sftp": ["SFTP 文件管理器", "SFTP File Manager"], "toggle-tail": ["Tail 日志查看", "Tail Log Viewer"], "toggle-manual": ["Linux 命令手册面板", "Linux Command Panel"], fullscreen: ["全屏", "Full Screen"], reconnect: ["重新连接", "Reconnect"], disconnect: ["断开当前连接", "Disconnect"], "duplicate-terminal": ["复制当前标签", "Duplicate Current Tab"], "previous-terminal": ["上一个标签", "Previous Tab"], "next-terminal": ["下一个标签", "Next Tab"], "reset-terminal": ["重置终端", "Reset Terminal"], clear: ["清除屏幕", "Clear Screen"], "toggle-log": ["开始/停止命令记录", "Start/Stop Logging"], "close-terminal": ["关闭当前标签", "Close Current Tab"], "transfer-tasks": ["传输任务", "Transfer Tasks"], upload: ["上传文件到当前目录", "Upload to Current Folder"], settings: ["应用设置", "Application Settings"], guide: ["使用说明", "User Guide"], "command-manual": ["Linux 命令手册", "Linux Command Manual"], shortcuts: ["快捷键说明", "Keyboard Shortcuts"], about: ["关于 Orbiterm", "About Orbiterm"],
-  };
-  document.querySelectorAll("[data-menu-action]").forEach((button) => { const label = actions[button.dataset.menuAction]; const span = button.querySelector("span"); if (!label || !span) return; const icon = span.querySelector("b")?.outerHTML || ""; span.innerHTML = `${icon}${english ? label[1] : label[0]}`; });
   text('[data-settings-page="general"]', "通用", "General");
   text('[data-settings-page="appearance"]', "界面", "Appearance");
   text('[data-settings-page="terminal"]', "终端", "Terminal");
@@ -1831,12 +1800,25 @@ function applyInterfaceLanguage() {
   text('[data-settings-page="performance"]', "性能与容量", "Performance & Capacity");
   text(".panel-title > span", "会话管理器", "Session Manager");
   title("#addSession", "新建 SSH 会话", "New SSH session");
+  title("#paletteTrigger", "打开命令面板", "Open command palette");
+  title("#bellBtn", "通知", "Notifications");
   title("#collapseSidebar", "折叠会话管理器", "Collapse session manager");
   title("#expandSidebar", "展开会话管理器", "Expand session manager");
+  title("#expandEmptySidebar", "展开会话管理器", "Expand session manager");
   title("#openSftpTool", "SFTP 文件管理器", "SFTP File Manager");
   title("#openTailTool", "Tail 日志查看", "Tail Log Viewer");
   title("#addGroup", "新建分组", "New group");
   title("#openManualTool", "Linux 命令手册", "Linux Command Manual");
+  title("#openFindTool", "终端内查找", "Find in terminal");
+  title("#reconnectTool", "重新连接", "Reconnect");
+  title("#sidebarSettings", "设置", "Settings");
+  title("#sidebarKeys", "凭据", "Credentials");
+  title("#sidebarFingerprint", "主机指纹", "Host keys");
+  title("#themeToggle", "切换亮色 / 深色", "Toggle light / dark theme");
+  title("#findPrevious", "上一个", "Previous match"); title("#findNext", "下一个", "Next match"); title("#closeFind", "关闭", "Close");
+  title("#closeSftp", "关闭文件管理器", "Close file manager"); title("#uploadFile", "上传多个文件", "Upload files"); title("#clearRemoteFilter", "清除筛选", "Clear filter");
+  title("#remoteBack", "后退", "Back"); title("#remoteForward", "前进", "Forward"); title("#remoteUp", "上一级", "Parent folder"); title("#copyRemotePath", "复制路径", "Copy path"); title("#remoteRefresh", "刷新", "Refresh");
+  title("#tailUp", "上一级", "Parent folder"); title("#tailRefresh", "刷新目录", "Refresh folder"); title("#tailSearchPrevious", "上一个", "Previous match"); title("#tailSearchNext", "下一个", "Next match");
   text(".server-monitor strong", "服务器监控", "Server Monitor");
   const monitorLabels = [["负载", "Load"], ["内存", "Memory"], ["磁盘", "Disk"], ["进程", "Processes"]];
   document.querySelectorAll(".server-monitor dt").forEach((node, index) => { if (monitorLabels[index]) node.textContent = english ? monitorLabels[index][1] : monitorLabels[index][0]; });
@@ -1864,6 +1846,7 @@ function applyInterfaceLanguage() {
   document.querySelectorAll("[data-close-help-modal]").forEach((node) => node.setAttribute("aria-label", english ? "Close help" : "关闭帮助"));
   const translations = [
     ["新开会话", "Open new session"],
+    ["搜索工作区、会话与命令…", "Search workspaces, sessions, and commands…"], ["通知", "Notifications"], ["暂无需要处理的会话", "No sessions need attention"], ["工作区", "Workspaces"], ["会话库", "Session Library"], ["个工作区", "workspaces"], ["传输：空闲", "Transfer: idle"], ["日志：关闭", "Logging: off"],
     ["通用", "General"], ["文件与预览", "Files & Preview"], ["日志", "Logging"], ["关闭软件前确认仍在连接的会话", "Confirm before closing connected sessions"], ["恢复上次窗口大小和位置", "Restore the previous window size and position"], ["启动时恢复上次打开的会话", "Restore previously open sessions at startup"], ["连接后默认打开", "Open after connecting"], ["不打开面板", "Do not open a panel"],
     ["终端字体", "Terminal font"], ["系统等宽字体", "System monospace font"], ["行高", "Line height"], ["字符间距", "Letter spacing"], ["选中文本后自动复制", "Copy selected text automatically"], ["终端右键行为", "Terminal right-click action"], ["打开右键菜单", "Open context menu"], ["直接粘贴", "Paste directly"], ["终端响铃", "Terminal bell"], ["声音", "Sound"], ["视觉提示", "Visual notification"],
     ["连接", "Connection"], ["新连接默认超时", "Default connection timeout"], ["SSH Keepalive 间隔", "SSH keepalive interval"], ["断线自动重连次数", "Automatic reconnect attempts"], ["0 表示关闭自动重连", "0 disables automatic reconnect"], ["自动重连间隔", "Automatic reconnect delay"], ["秒", "seconds"],
@@ -1872,11 +1855,11 @@ function applyInterfaceLanguage() {
     ["基本信息", "Basic"], ["认证", "Authentication"], ["终端", "Terminal"], ["连接名称", "Session name"], ["IP / 主机地址", "IP / Host"], ["端口", "Port"], ["用户名", "Username"], ["密码", "Password"], ["密码认证", "Password"], ["SSH 私钥", "SSH private key"], ["SSH Agent", "SSH Agent"], ["认证方式", "Authentication method"], ["会话分组", "Session group"], ["私钥文件", "Private key"], ["私钥口令（可选，不保存）", "Passphrase (optional, not saved)"], ["终端类型", "Terminal type"], ["连接超时（秒）", "Timeout (seconds)"], ["启动 Shell / 命令", "Startup shell / command"], ["保存此会话", "Save this session"], ["取消", "Cancel"], ["确定", "OK"], ["保存并连接", "Save and Connect"], ["浏览", "Browse"],
     ["首次连接会自动保存服务器主机指纹；以后指纹变化时会阻止连接。", "The server host key is saved automatically on first connection. A changed key will block future connections."], ["留空时读取远端账户的默认登录 Shell；仅在需要指定 Bash、Zsh 或启动 tmux 时填写。", "Leave empty to use the remote account's default login shell. Set this only to start Bash, Zsh, tmux, or another command."],
     ["远程文件", "Remote files"], ["未连接", "Disconnected"], ["上传", "Upload"], ["↑ 上传", "↑ Upload"], ["下载", "Download"], ["↓ 下载", "↓ Download"], ["新建", "New"], ["＋ 新建", "+ New"], ["新建文件", "New file"], ["新建文件夹", "New folder"], ["名称", "Name"], ["大小", "Size"], ["归属用户", "Owner"], ["修改时间", "Modified"], ["权限", "Permissions"], ["暂无传输任务", "No transfers"], ["取消传输", "Cancel transfer"], ["连接后可浏览远程文件", "Connect to browse remote files"], ["0 项", "0 items"],
-    ["Tail 日志", "Tail Logs"], ["查看", "View"], ["暂停", "Pause"], ["尚未选择文件", "No file selected"], ["点击路径栏选择日志文件", "Click the path field to select a log file"], ["请输入绝对路径或从目录中选择文件", "Enter an absolute path or select a file from a folder"], ["-N 末尾", "-N From end"], ["+N 开头", "+N From start"], ["默认", "Default"], ["Linux 命令手册", "Linux Command Manual"], ["选择左侧命令查看用法", "Select a command to view details"], ["关闭", "Close"], ["行号", "Line numbers"], ["编辑", "Edit"], ["保存到远端", "Save remotely"], ["多行粘贴", "Multi-line paste"], ["合并换行为空格", "Join lines with spaces"], ["发送到终端", "Send to terminal"],
+    ["Tail 日志", "Tail Logs"], ["查看", "View"], ["暂停", "Pause"], ["继续", "Resume"], ["尚未选择文件", "No file selected"], ["点击路径栏选择日志文件", "Click the path field to select a log file"], ["请输入绝对路径或从目录中选择文件", "Enter an absolute path or select a file from a folder"], ["全部内容", "All content"], ["最近 N 行", "Last N lines"], ["开头 N 行", "First N lines"], ["持续追加", "Follow changes"], ["-N 末尾", "-N From end"], ["+N 开头", "+N From start"], ["默认", "Default"], ["Linux 命令手册", "Linux Command Manual"], ["选择左侧命令查看用法", "Select a command to view details"], ["关闭", "Close"], ["行号", "Line numbers"], ["编辑", "Edit"], ["保存到远端", "Save remotely"], ["多行粘贴", "Multi-line paste"], ["合并换行为空格", "Join lines with spaces"], ["发送到终端", "Send to terminal"],
     ["复制", "Copy"], ["粘贴", "Paste"], ["全选", "Select all"], ["查找", "Find"], ["清屏", "Clear screen"], ["复制会话标签", "Duplicate session tab"], ["新连接", "New connection"], ["断开连接", "Disconnect"], ["重新连接", "Reconnect"], ["开始/停止命令记录", "Start/stop logging"], ["关闭标签", "Close tab"], ["移出分屏", "Remove from split"], ["在此分组新建会话", "New session in group"], ["重命名分组", "Rename group"], ["删除分组", "Delete group"], ["连接", "Connect"], ["移动到分组…", "Move to group…"], ["打开", "Open"], ["重命名", "Rename"], ["修改权限", "Change permissions"], ["属性", "Properties"], ["删除", "Delete"],
     ["远程文件内容", "Remote file content"], ["远程文件", "Remote file"], ["0 字符", "0 characters"], ["查找内容", "Find content"], ["正在读取远程文件…", "Reading remote file…"],
     ["使用 Windows 凭据管理器记住密码", "Remember password in Windows Credential Manager"], ["终端切换目录时同步 SFTP 路径", "Sync SFTP path with terminal directory"], ["浅色", "Light"], ["深色", "Dark"], ["简体中文", "简体中文"], ["浅色终端", "Light terminal"], ["深色终端", "Dark terminal"], ["方块", "Block"], ["竖线", "Bar"], ["下划线", "Underline"],
-    ["默认 3，单方向最多 4 个连接", "Default: 3; up to 4 connections per direction"], ["默认 4，单方向最多 4 个连接", "Default: 4; up to 4 connections per direction"], ["默认 200,000 行", "Default: 200,000 lines"], ["默认 64 MB", "Default: 64 MB"], ["默认每次读取 4 MB", "Default: 4 MB per read"], ["默认 32 MB", "Default: 32 MB"], ["默认 500 项", "Default: 500 items"], ["默认 120 ms，0 表示无延迟", "Default: 120 ms; 0 disables the delay"], ["默认 10,000 行，数值越大占用内存越多", "Default: 10,000 lines; larger values use more memory"],
+    ["默认 3，单方向最多 4 个连接", "Default: 3; up to 4 connections per direction"], ["默认 4，单方向最多 4 个连接", "Default: 4; up to 4 connections per direction"], ["默认 200,000 行", "Default: 200,000 lines"], ["默认 64 MB", "Default: 64 MB"], ["默认每次读取 4 MB", "Default: 4 MB per read"], ["默认 32 MB", "Default: 32 MB"], ["默认 500 项", "Default: 500 items"], ["默认 120 ms，0 表示无延迟", "Default: 120 ms; 0 disables the delay"], ["默认 10,000 行，数值越大占用内存越多", "Default: 10,000 lines; larger values use more memory"], ["清除已完成", "Clear completed"], ["全选终端内容", "Select all terminal text"], ["开始/停止当前会话日志", "Start/stop current session log"],
   ];
   const sourceIndex = english ? 0 : 1;
   const targetIndex = english ? 1 : 0;
@@ -1962,8 +1945,8 @@ async function submitSession(event) {
   event.preventDefault();
   const session = formSession();
   const secret = session.authType === "password" ? el("password").value : session.authType === "publickey" ? el("passphrase").value : "";
-  if (session.authType === "password" && !secret) return toast("请输入登录密码", "error");
-  if (session.authType === "publickey" && !session.privateKey) return toast("请选择私钥文件", "error");
+  if (session.authType === "password" && !secret) return toast(tr("请输入登录密码", "Enter the login password"), "error");
+  if (session.authType === "publickey" && !session.privateKey) return toast(tr("请选择私钥文件", "Choose a private key file"), "error");
 
   const button = el("connectButton");
   const idleButtonText = ["connect", "quick"].includes(state.sessionModalMode) ? tr("连接", "Connect") : tr("保存并连接", "Save and Connect");
@@ -2001,6 +1984,36 @@ async function submitSession(event) {
   }
 }
 
+function hasUsableTerminalGeometry(record) {
+  if (!record?.host?.isConnected || document.hidden || window.innerWidth < 300 || window.innerHeight < 200) return false;
+  const rect = record.host.getBoundingClientRect();
+  return rect.width >= 160 && rect.height >= 80 && getComputedStyle(record.host).display !== "none";
+}
+
+function fitTerminalRecord(record) {
+  if (!hasUsableTerminalGeometry(record)) return false;
+  try {
+    record.fit.fit();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function scheduleTerminalResize(record, cols, rows) {
+  clearTimeout(record.resizeTimer);
+  record.resizeTimer = null;
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 20 || rows < 3 || !hasUsableTerminalGeometry(record)) return false;
+  record.resizeTimer = setTimeout(() => {
+    record.resizeTimer = null;
+    const currentCols = record.terminal.cols;
+    const currentRows = record.terminal.rows;
+    if (!record.connected || currentCols < 20 || currentRows < 3 || !hasUsableTerminalGeometry(record)) return;
+    invoke(record.session.local ? "local_terminal_resize" : "ssh_resize", { id: record.id, cols: currentCols, rows: currentRows }).catch(() => {});
+  }, 60);
+  return true;
+}
+
 function createTerminalView(session) {
   const id = crypto.randomUUID();
   const host = document.createElement("div");
@@ -2022,21 +2035,25 @@ function createTerminalView(session) {
   terminal.loadAddon(fit);
   terminal.loadAddon(search);
   terminal.open(host.querySelector(".split-term"));
-  fit.fit();
+  fitTerminalRecord({ host, fit });
   const fitObserver = new ResizeObserver(() => {
-    if (host.classList.contains("active") || host.classList.contains("split-visible")) requestAnimationFrame(() => fit.fit());
+    if (host.classList.contains("active") || host.classList.contains("split-visible")) requestAnimationFrame(() => fitTerminalRecord({ host, fit }));
   });
   fitObserver.observe(host);
   document.fonts?.ready.then(() => {
     if (!host.isConnected) return;
     const rec = state.terminals.get(id);
     if (rec) applyTerminalChrome(rec);
-    requestAnimationFrame(() => fit.fit());
+    requestAnimationFrame(() => fitTerminalRecord(rec));
   });
-  terminal.writeln(session.local ? "正在启动本地 PowerShell…" : `Connecting to ${session.host}:${session.port}...`);
+  terminal.writeln(session.local ? tr("正在启动本地 PowerShell…", "Starting local PowerShell…") : `Connecting to ${session.host}:${session.port}...`);
 
   const initialRemotePath = state.preferences.persistRemotePath ? state.preferences.remotePathsBySession[session.id] || "/" : "/";
-  const record = { id, session, terminal, fit, fitObserver, search, host, connected: false, stopped: false, manualDisconnect: false, reconnectAttempts: 0, reconnectTimer: null, logging: false, logPath: "", latency: null, writeChain: Promise.resolve(), resizeTimer: null, inputTimer: null, inputQueue: [], inputBytes: 0, emptyReadCount: 0, cwdSyncTimer: null, bootstrapPending: false, bootstrapInstalling: false, bootstrapInstalled: false, bootstrapWanted: false, bootstrapBuffer: new Uint8Array(), bootstrapTimer: null, bootstrapFallbackTimer: null, textDecoder: new TextDecoder(), altScreen: false, sftpHistory: [initialRemotePath], sftpHistoryIndex: 0, sftpRequestId: 0, tailFile: "", tailOffset: 0, tailInitialized: false, tailLines: [], tailLineBase: 0, tailPaused: false, tailMode: "last", tailCount: state.preferences.tailDefaultLines, tailFollow: true };
+  const record = { id, session, terminal, fit, fitObserver, search, host, connected: false, stopped: false, manualDisconnect: false, reconnectAttempts: 0, reconnectTimer: null, logging: false, logPath: "", latency: null, writeChain: Promise.resolve(), resizeTimer: null, inputTimer: null, inputQueue: [], inputBytes: 0, emptyReadCount: 0, cwdSyncTimer: null, bootstrapPending: false, bootstrapInstalling: false, bootstrapInstalled: false, bootstrapAttempted: false, bootstrapWanted: false, bootstrapBuffer: new Uint8Array(), bootstrapHiddenPrompt: "", bootstrapTimer: null, textDecoder: new TextDecoder(), altScreen: false, colorizePending: "", colorizeTimer: null, selectionCopyTimer: null, copySelectionHandler: null, sftpHistory: [initialRemotePath], sftpHistoryIndex: 0, sftpRequestId: 0, tailFile: "", tailOffset: 0, tailInitialized: false, tailLines: [], tailLineBase: 0, tailPaused: false, tailMode: "last", tailCount: state.preferences.tailDefaultLines, tailFollow: true };
+  record.readTimer = null;
+  record.readInFlight = false;
+  record.readWakeRequested = false;
+  record.interactiveUntil = 0;
   state.terminals.set(id, record);
   state.remotePaths.set(id, initialRemotePath);
   state.remoteUiByTerminal.set(id, {
@@ -2049,10 +2066,18 @@ function createTerminalView(session) {
     sort: { key: "name", direction: "asc" },
     renderLimit: state.preferences.sftpPageSize,
   });
-  terminal.onSelectionChange(() => {
+  const copySelection = () => {
     if (!state.preferences.copyOnSelect || !terminal.hasSelection()) return;
-    navigator.clipboard.writeText(terminal.getSelection()).catch(() => {});
-  });
+    writeClipboardText(terminal.getSelection()).catch(() => {});
+  };
+  const scheduleSelectionCopy = () => {
+    clearTimeout(record.selectionCopyTimer);
+    record.selectionCopyTimer = setTimeout(copySelection, 20);
+  };
+  record.copySelectionHandler = (event) => {
+    if (event.button === 0) scheduleSelectionCopy();
+  };
+  host.addEventListener("mouseup", record.copySelectionHandler);
   terminal.onBell(() => {
     if (state.preferences.bellStyle !== "visual") return;
     host.classList.remove("terminal-bell");
@@ -2100,6 +2125,10 @@ function createTerminalView(session) {
     record.writeChain = record.writeChain
       .catch(() => {})
       .then(() => invoke(record.session.local ? "local_terminal_write" : "ssh_write", { id, data: Array.from(payload) }))
+      .then(() => {
+        prioritizeTerminalInput(record);
+        wakeTerminalRead(record);
+      })
       .catch((error) => {
         if (!String(error).includes("输入积压")) {
           record.connected = false;
@@ -2110,6 +2139,7 @@ function createTerminalView(session) {
   };
   terminal.onData((data) => {
     if (record.connected) {
+      prioritizeTerminalInput(record);
       const encoded = encoder.encode(data);
       for (let offset = 0; offset < encoded.length; offset += 32 * 1024) {
         const chunk = encoded.slice(offset, offset + 32 * 1024);
@@ -2121,17 +2151,13 @@ function createTerminalView(session) {
     }
   });
   terminal.onResize(({ cols, rows }) => {
-    clearTimeout(record.resizeTimer);
-    record.resizeTimer = setTimeout(() => {
-      if (record.connected) invoke(record.session.local ? "local_terminal_resize" : "ssh_resize", { id, cols, rows }).catch(() => {});
-    }, 60);
-    if (state.activeId === id) el("terminalSize").textContent = `${cols} × ${rows}`;
+    if (scheduleTerminalResize(record, cols, rows) && state.activeId === id) el("terminalSize").textContent = `${cols} × ${rows}`;
   });
 
   const tab = document.createElement("button");
   tab.className = "tab active";
   tab.dataset.terminalId = id;
-  tab.innerHTML = `<i></i><span>${escapeHtml(session.name)}</span><small>${escapeHtml(session.host)}</small><b title="关闭">×</b>`;
+  tab.innerHTML = `<i></i><span>${escapeHtml(session.name)}</span><small>${escapeHtml(session.host)}</small><b title="${tr("关闭", "Close")}">×</b>`;
   el("terminalTabs").append(tab);
   tab.addEventListener("click", (event) => event.target.tagName === "B" ? closeTerminal(id) : activateTerminal(id));
   activateTerminal(id);
@@ -2141,6 +2167,7 @@ function createTerminalView(session) {
 
 function updateTerminalState(record, status) {
   record.status = status;
+  publishSftpTransfers();
   const tab = document.querySelector(`.tab[data-terminal-id="${record.id}"]`);
   if (tab) tab.dataset.status = status;
   updateSplitBar(record);
@@ -2158,7 +2185,7 @@ async function connectSession(session, secret) {
       privateKey: session.privateKey || null, passphrase: session.authType === "publickey" ? secret : null,
       expectedFingerprint: session.fingerprint, terminalType: session.terminalType,
       shellCommand: session.shellCommand || null,
-      cols: record.terminal.cols, rows: record.terminal.rows, timeoutSeconds: session.timeout,
+      cols: Math.max(20, record.terminal.cols || 80), rows: Math.max(3, record.terminal.rows || 24), timeoutSeconds: session.timeout,
       keepaliveSeconds: state.preferences.keepaliveSeconds,
     } });
     record.connected = true;
@@ -2178,13 +2205,11 @@ async function connectSession(session, secret) {
       }
     }
     updateTerminalState(record, "connected");
-    rememberRecentSession(session);
     persistOpenSessionIds();
     record.bootstrapWanted = Boolean(session.syncSftpPath && !session.shellCommand);
     record.terminal.focus();
     updateActiveStatus();
     readLoop(record);
-    if (record.bootstrapWanted) record.bootstrapFallbackTimer = setTimeout(() => installCwdIntegration(record), 1500);
     if (!el("sftpPanel").classList.contains("hidden")) refreshRemote();
     if (state.preferences.defaultDrawer === "sftp") toggleSftp(true);
     else if (state.preferences.defaultDrawer === "tail") openTailPanel();
@@ -2199,7 +2224,7 @@ async function connectSession(session, secret) {
     record.connected = false;
     updateTerminalState(record, "error");
     record.terminal.writeln(`\r\n\x1b[31m${tr("连接失败", "Connection failed")}：${localizeRuntimeText(error)}\x1b[0m`);
-    toast(`连接 ${session.name} 失败`, "error");
+    toast(tr(`连接 ${session.name} 失败`, `Failed to connect to ${session.name}`), "error");
     updateActiveStatus();
     scheduleAutoReconnect(record);
     return null;
@@ -2211,8 +2236,8 @@ async function connectLocalTerminal(session) {
   try {
     const shell = await invoke("local_terminal_open", {
       id: record.id,
-      cols: record.terminal.cols,
-      rows: record.terminal.rows,
+      cols: Math.max(20, record.terminal.cols || 80),
+      rows: Math.max(3, record.terminal.rows || 24),
       cwd: record.session.cwd || null,
     });
     record.connected = true;
@@ -2228,7 +2253,7 @@ async function connectLocalTerminal(session) {
     record.connected = false;
     updateTerminalState(record, "error");
     record.terminal.writeln(`\r\n\x1b[31m${tr("启动本地终端失败", "Failed to start local terminal")}：${localizeRuntimeText(error)}\x1b[0m`);
-    toast("启动本地 PowerShell 失败", "error");
+    toast(tr("启动本地 PowerShell 失败", "Failed to start local PowerShell"), "error");
     updateActiveStatus();
     return null;
   }
@@ -2303,21 +2328,49 @@ function resetActiveTerminal() {
   const record = activeTerminal();
   if (!record) return;
   record.terminal.reset();
-  requestAnimationFrame(() => { record.fit.fit(); record.terminal.focus(); });
+  requestAnimationFrame(() => { fitTerminalRecord(record); record.terminal.focus(); });
+}
+
+function prioritizeTerminalInput(record) {
+  if (record.stopped || !record.connected) return;
+  record.interactiveUntil = performance.now() + 1000;
+  record.emptyReadCount = 0;
+  flushColorizedOutput(record);
+}
+
+function wakeTerminalRead(record) {
+  if (record.stopped || !record.connected) return;
+  clearTimeout(record.readTimer);
+  record.readTimer = null;
+  if (record.readInFlight) {
+    record.readWakeRequested = true;
+    return;
+  }
+  void readLoop(record);
 }
 
 async function readLoop(record) {
-  if (record.stopped || !record.connected) return;
+  if (record.stopped || !record.connected || record.readInFlight) return;
+  clearTimeout(record.readTimer);
+  record.readTimer = null;
+  record.readInFlight = true;
   try {
     const result = await invoke(record.session.local ? "local_terminal_read" : "ssh_read", { id: record.id });
+    if (record.stopped || !record.connected) return;
     if (result.data.length) {
       let output = new Uint8Array(result.data);
       if (record.bootstrapPending) output = finishTerminalBootstrap(record, output);
       if (output.length) {
         const text = record.textDecoder.decode(output, { stream: true });
-        record.terminal.write(colorizeClientOutput(record, text));
-        if (record.bootstrapWanted && !record.bootstrapInstalling && !record.bootstrapInstalled) {
-          if (/(?:^|\r?\n)[^\r\n]{0,160}[#$%>]\s*$/.test(text)) setTimeout(() => installCwdIntegration(record), 120);
+        const trailingPrompt = record.bootstrapWanted && !record.bootstrapInstalling && !record.bootstrapInstalled
+          ? splitTrailingShellPrompt(text)
+          : null;
+        if (trailingPrompt) {
+          if (trailingPrompt.before) writeColorizedOutput(record, trailingPrompt.before);
+          record.bootstrapHiddenPrompt = trailingPrompt.prompt;
+          void installCwdIntegration(record, false);
+        } else {
+          writeColorizedOutput(record, text);
         }
       }
     }
@@ -2327,6 +2380,7 @@ async function readLoop(record) {
       toast(result.logError, "error");
     }
     if (result.eof) {
+      flushColorizedOutput(record);
       record.connected = false;
       updateTerminalState(record, "disconnected");
       const exitText = result.exitStatus == null ? "" : `（退出码 ${result.exitStatus}）`;
@@ -2338,10 +2392,13 @@ async function readLoop(record) {
     const idleDelay = state.activeId === record.id
       ? Math.min(150, 75 * 2 ** Math.min(Math.max(record.emptyReadCount - 1, 0), 1))
       : Math.min(1500, 500 * 2 ** Math.min(Math.max(record.emptyReadCount - 1, 0), 2));
-    const delay = result.data.length || result.pendingInput ? 16 : idleDelay;
-    setTimeout(() => readLoop(record), delay);
+    const delay = record.readWakeRequested ? 0
+      : result.data.length || result.pendingInput || performance.now() < record.interactiveUntil ? 16 : idleDelay;
+    record.readWakeRequested = false;
+    record.readTimer = setTimeout(() => readLoop(record), delay);
   } catch (error) {
     if (!record.stopped) {
+      flushColorizedOutput(record);
       record.connected = false;
       updateTerminalState(record, "error");
       record.terminal.writeln(`\r\n\x1b[31m${tr("连接中断", "Connection interrupted")}：${localizeRuntimeText(error)}\x1b[0m`);
@@ -2349,6 +2406,8 @@ async function readLoop(record) {
       scheduleAutoReconnect(record);
     }
     return;
+  } finally {
+    record.readInFlight = false;
   }
 }
 
@@ -2414,10 +2473,11 @@ function updateSplitBar(record) {
 }
 
 function fitVisibleTerminals() {
+  if (detachedSftp) return;
   const ids = visibleSplitIds();
   const run = () => {
     ids.forEach((id) => {
-      try { state.terminals.get(id)?.fit.fit(); } catch { /* xterm may not be attached yet */ }
+      fitTerminalRecord(state.terminals.get(id));
     });
   };
   requestAnimationFrame(() => {
@@ -2551,7 +2611,7 @@ function activateTerminal(id) {
   el("emptyState").classList.add("hidden");
   applySplitLayout();
   syncActiveRemoteUi(record);
-  renderRemoteEntries(state.remoteEntries, record.connected ? "正在刷新…" : "连接后可浏览远程文件");
+  renderRemoteEntries(state.remoteEntries, record.connected ? tr("正在刷新…", "Refreshing…") : tr("连接后可浏览远程文件", "Connect to browse remote files"));
   renderTransferTasks();
   scheduleTransferProgressRender();
   el("openSftpTool").disabled = Boolean(record.session.local);
@@ -2567,7 +2627,7 @@ async function closeTerminal(id, reconnecting = false) {
   if (!record) return;
   const sessionTransferIds = [...state.transferTerminals].filter(([, terminalId]) => terminalId === id).map(([transferId]) => transferId);
   if (sessionTransferIds.length) {
-    const accepted = await appPrompt({ title: "取消传输并关闭", message: "该会话仍有文件正在传输。关闭会话将取消传输，是否继续？", input: false, confirmText: "关闭会话" });
+    const accepted = await appPrompt({ title: tr("取消传输并关闭", "Cancel transfers and close"), message: tr("该会话仍有文件正在传输。关闭会话将取消传输，是否继续？", "This session still has active transfers. Closing it will cancel them. Continue?"), input: false, confirmText: tr("关闭会话", "Close session") });
     if (!accepted) return;
     await Promise.all(sessionTransferIds.map((transferId) => invoke("cancel_transfer", { transferId }).catch(() => {})));
     const sessionPromises = sessionTransferIds.map((transferId) => state.transferPromises.get(transferId)).filter(Boolean);
@@ -2583,8 +2643,11 @@ async function closeTerminal(id, reconnecting = false) {
   clearTimeout(record.resizeTimer);
   clearTimeout(record.inputTimer);
   clearTimeout(record.cwdSyncTimer);
+  clearTimeout(record.readTimer);
   clearTimeout(record.bootstrapTimer);
-  clearTimeout(record.bootstrapFallbackTimer);
+  clearTimeout(record.colorizeTimer);
+  clearTimeout(record.selectionCopyTimer);
+  if (record.copySelectionHandler) record.host.removeEventListener("mouseup", record.copySelectionHandler);
   record.inputQueue = [];
   record.inputBytes = 0;
   record.connectionSecret = "";
@@ -2612,7 +2675,7 @@ async function closeTerminal(id, reconnecting = false) {
       state.selectedRemote = null;
       state.selectedRemotePaths = new Set();
       state.remoteSelectionAnchor = null;
-      renderRemoteEntries([], "连接 SSH 后可浏览远程文件");
+      renderRemoteEntries([], tr("连接 SSH 后可浏览远程文件", "Connect with SSH to browse remote files"));
       el("emptyState").classList.remove("hidden");
       ["sftpPanel", "tailPanel", "manualPanel"].forEach((panelId) => el(panelId).classList.add("hidden"));
       el("openSftpTool").disabled = true;
@@ -2625,6 +2688,7 @@ async function closeTerminal(id, reconnecting = false) {
     }
   } else {
     applySplitLayout();
+    renderSessions();
   }
   if (!reconnecting) persistOpenSessionIds();
 }
@@ -2635,6 +2699,9 @@ function activeTerminal() {
 
 function updateActiveStatus() {
   const record = activeTerminal();
+  const hasSessions = state.terminals.size > 0;
+  document.querySelector(".terminal-pane").classList.toggle("terminal-empty", !hasSessions);
+  browserController?.setAvailable(hasSessions);
   const connected = Boolean(record?.connected);
   document.querySelector(".server-monitor")?.classList.add("hidden");
   clearTimeout(state.monitorTimer);
@@ -2692,16 +2759,16 @@ async function startSessionLog(record, askForPath = true) {
 
 async function toggleSessionLog(id = state.activeId) {
   const record = state.terminals.get(id) || activeTerminal();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  if (record.session.local) return toast("本地 PowerShell 暂不使用 SSH 会话日志", "error");
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
+  if (record.session.local) return toast(tr("本地 PowerShell 暂不使用 SSH 会话日志", "Session logging is not available for local PowerShell"), "error");
   try {
     if (record.logging) {
       await invoke("session_log_stop", { id: record.id });
       record.logging = false;
-      toast("会话日志已停止", "success");
+      toast(tr("会话日志已停止", "Session logging stopped"), "success");
     } else {
       if (!await startSessionLog(record)) return;
-      toast("会话日志已开始记录", "success");
+      toast(tr("会话日志已开始记录", "Session logging started"), "success");
     }
     updateActiveStatus();
   } catch (error) {
@@ -2750,7 +2817,7 @@ function formatSize(size) {
 
 function fileIcon(entry) {
   if (entry.isDir) {
-    return `<i class="file-icon folder-icon">${ic('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>')}</i>`;
+    return `<i class="file-icon folder-icon"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path fill="#d99b23" d="M2 6a2 2 0 0 1 2-2h5l2 2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/><path fill="#ffe6a3" d="M4 8h16v4H4z"/><path fill="#f5c344" d="M2 11a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z"/></svg></i>`;
   }
   const extension = entry.name.includes(".") ? entry.name.split(".").pop().toLowerCase() : "";
   const kind = ["zip", "tar", "gz", "7z", "rar"].includes(extension) ? "archive"
@@ -2774,12 +2841,12 @@ function visibleRemoteEntries() {
   });
 }
 
-function renderRemoteEntries(entries, emptyText = "此目录为空") {
+function renderRemoteEntries(entries, emptyText = tr("此目录为空", "This folder is empty")) {
   const visible = entries === state.remoteEntries ? visibleRemoteEntries() : entries;
   const rendered = visible.slice(0, state.remoteRenderLimit);
   const rows = rendered.map((entry) => `<div class="remote-row${state.selectedRemotePaths.has(entry.path) ? " selected" : ""}" tabindex="0" title="${escapeHtml(entry.path)}" data-path="${escapeHtml(entry.path)}" data-dir="${entry.isDir}" data-name="${escapeHtml(entry.name)}" data-permissions="${entry.permissions}"><span>${fileIcon(entry)}<b>${escapeHtml(entry.name)}</b></span><span>${entry.isDir ? "—" : formatSize(entry.size)}</span><span>${escapeHtml(entry.owner || "—")}</span><span>${entry.modified ? new Date(entry.modified * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" }) : ""}</span><span>${((entry.permissions || 0) & 0o7777).toString(8).padStart(3, "0")}</span></div>`).join("");
   const more = rendered.length < visible.length ? `<button class="remote-load-more" data-load-more-remote>${tr(`继续显示（${rendered.length}/${visible.length}）`, `Show more (${rendered.length}/${visible.length})`)}</button>` : "";
-  el("remoteFiles").innerHTML = visible.length ? rows + more : `<div class="file-placeholder">${escapeHtml(state.remoteFilter ? "没有匹配的文件" : emptyText)}</div>`;
+  el("remoteFiles").innerHTML = visible.length ? rows + more : `<div class="file-placeholder">${escapeHtml(state.remoteFilter ? tr("没有匹配的文件", "No matching files") : emptyText)}</div>`;
   document.querySelectorAll(".file-header [data-sort]").forEach((button) => {
     button.classList.toggle("active", button.dataset.sort === state.remoteSort.key);
     button.querySelector("i").textContent = button.dataset.sort === state.remoteSort.key ? (state.remoteSort.direction === "asc" ? "↑" : "↓") : "";
@@ -2826,7 +2893,7 @@ async function invokeSftpWithReconnect(command, args, terminalId) {
 
 async function refreshRemote(nextPath = null, trackHistory = true) {
   const record = activeTerminal();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
   const path = normalizeRemotePath((nextPath ?? el("remotePath").value) || "/", state.remotePath);
   const requestId = ++record.sftpRequestId;
   const terminalId = record.id;
@@ -2842,7 +2909,7 @@ async function refreshRemote(nextPath = null, trackHistory = true) {
       record.sftpHistoryIndex = record.sftpHistory.length - 1;
     }
     state.remotePaths.set(terminalId, path);
-    if (state.preferences.persistRemotePath) {
+    if (state.preferences.persistRemotePath && !detachedSftp) {
       state.preferences.remotePathsBySession[record.session.id] = path;
       localStorage.setItem(PREFERENCES_KEY, JSON.stringify(state.preferences));
     }
@@ -2893,6 +2960,7 @@ function transferStatusText(status) {
   return ({
     queued: english ? "Queued" : "等待中",
     running: english ? "Transferring" : "传输中",
+    paused: english ? "Paused" : "已暂停",
     completed: english ? "Completed" : "已完成",
     cancelled: english ? "Cancelled" : "已取消",
     error: english ? "Failed" : "失败",
@@ -2900,6 +2968,7 @@ function transferStatusText(status) {
 }
 
 function renderTransferTasks() {
+  publishSftpTransfers();
   const tasks = [...state.transferMeta.entries()].filter(([, task]) => task.terminalId === state.activeId).reverse();
   el("transferTasks").classList.toggle("hidden", tasks.length === 0);
   el("transferTaskCount").textContent = tasks.length ? `${tasks.length}` : "";
@@ -2911,25 +2980,33 @@ function renderTransferTasks() {
       row = document.createElement("div");
       row.className = "transfer-task";
       row.dataset.transferId = id;
-      row.innerHTML = `<i></i><span><b></b><small></small></span><div class="transfer-task-progress"><progress max="100"></progress><output></output></div><button type="button">×</button>`;
+      row.innerHTML = `<i></i><span><b></b><small></small></span><div class="transfer-task-progress"><progress max="100"></progress><output></output></div><div class="transfer-task-actions"><button type="button" class="pause-transfer"></button><button type="button" class="cancel-transfer">×</button></div>`;
     }
     const percent = task.total > 0 ? Math.min(100, task.transferred / task.total * 100) : 0;
     const progressText = task.status === "running" || task.status === "completed"
       ? `${task.total > 0 ? `${formatSize(task.transferred)} / ${formatSize(task.total)}` : formatSize(task.transferred)} · ${transferStatusText(task.status)}`
       : `${transferStatusText(task.status)}${task.error ? ` · ${task.error}` : ""}`;
+    const detailText = task.paused ? `${formatSize(task.transferred)} · ${transferStatusText("paused")}` : progressText;
     const icon = task.status === "completed" ? "✓" : task.status === "error" ? "!" : task.status === "cancelled" ? "×" : task.kind === "下载" ? "↓" : "↑";
-    row.dataset.status = task.status;
+    row.dataset.status = task.paused ? "paused" : task.status;
     row.querySelector("i").textContent = icon;
     const name = row.querySelector("b");
     name.textContent = task.name;
     name.title = task.name;
     const detail = row.querySelector("small");
-    detail.textContent = progressText;
-    detail.title = progressText;
+    detail.textContent = detailText;
+    detail.title = detailText;
     row.querySelector("progress").value = percent;
     row.querySelector("output").textContent = task.total > 0 ? `${Math.round(percent)}%` : "—%";
-    const cancel = row.querySelector("button");
+    const cancel = row.querySelector(".cancel-transfer");
     const cancellable = ["queued", "running"].includes(task.status);
+    const pause = row.querySelector(".pause-transfer");
+    pause.classList.toggle("hidden", !cancellable);
+    pause.dataset.pauseTransferId = id;
+    pause.textContent = task.paused ? "▶" : "Ⅱ";
+    pause.title = task.paused ? tr("继续传输", "Resume transfer") : tr("暂停传输", "Pause transfer");
+    pause.setAttribute("aria-label", pause.title);
+    pause.disabled = Boolean(task.pausePending);
     cancel.classList.toggle("hidden", !cancellable);
     cancel.disabled = false;
     if (cancellable) {
@@ -2960,7 +3037,9 @@ function pumpTransferQueue(direction) {
     }
   }
   while (queue.length && activeSlots.size < transferConcurrency(direction)) {
-    const item = queue.shift();
+    const nextIndex = queue.findIndex((item) => !state.transferMeta.get(item.transferId)?.paused);
+    if (nextIndex < 0) break;
+    const [item] = queue.splice(nextIndex, 1);
     let slot = 0;
     while (activeSlots.has(slot)) slot += 1;
     activeSlots.add(slot);
@@ -2995,7 +3074,7 @@ function scheduleTransferProgressRender() {
     const startedAt = Math.min(...active.map((item) => item.startedAt));
     const seconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
     const sizeText = total ? `${formatSize(transferred)} / ${formatSize(total)}` : formatSize(transferred);
-    const taskText = active.length > 1 ? `${active.length} 个任务` : active[0].name;
+    const taskText = active.length > 1 ? tr(`${active.length} 个任务`, `${active.length} tasks`) : active[0].name;
     setTransfer(`${taskText} · ${sizeText} · ${formatSize(transferred / seconds)}/s`, true);
     renderTransferTasks();
   });
@@ -3033,6 +3112,8 @@ function unregisterTransfer(transferId, status = "completed", error = "") {
   const meta = state.transferMeta.get(transferId);
   if (meta) {
     meta.status = status;
+    meta.paused = false;
+    meta.pausePending = false;
     meta.error = error;
     meta.finishedAt = performance.now();
   }
@@ -3044,6 +3125,7 @@ function unregisterTransfer(transferId, status = "completed", error = "") {
 }
 
 async function cancelTransferTask(transferId) {
+  if (detachedSftp) return sendSftpAction("cancel", { transferId });
   const task = state.transferMeta.get(transferId);
   if (!task || !["queued", "running"].includes(task.status)) return;
   const wasRunning = task.status === "running";
@@ -3056,7 +3138,7 @@ async function cancelTransferTask(transferId) {
 function finishTransferBatch(message, terminalId) {
   const remaining = [...state.transferMeta.values()].filter((task) => task.terminalId === terminalId && ["queued", "running"].includes(task.status));
   if (state.activeId === terminalId) {
-    if (remaining.length) setTransfer(`${message} · 另有 ${remaining.length} 个任务正在传输`, true);
+    if (remaining.length) setTransfer(tr(`${message} · 另有 ${remaining.length} 个任务正在传输`, `${message} · ${remaining.length} other transfer(s) active`), true);
     else setTransfer(message);
   }
   if (!state.activeTransferIds.size) {
@@ -3066,32 +3148,36 @@ function finishTransferBatch(message, terminalId) {
   }
 }
 
-async function uploadPaths(localPaths) {
-  const record = activeTerminal();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
+async function uploadPaths(localPaths, context = null) {
+  const record = context ? state.terminals.get(context.sessionId) : activeTerminal();
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
   if (!localPaths.length) return;
-  const destinationPath = state.remotePath;
+  const destinationPath = context?.path || state.remotePath;
   const names = localPaths.map((path) => path.replaceAll("\\", "/").split("/").pop());
   const duplicateNames = duplicateBaseNames(localPaths);
   if (duplicateNames.length) {
     const preview = duplicateNames.slice(0, 5).join("、");
-    return toast(`所选项目包含同名文件：${preview}。请分批上传或先重命名。`, "error");
+    return toast(tr(`所选项目包含同名文件：${preview}。请分批上传或先重命名。`, `The selection contains duplicate file names: ${preview}. Upload them separately or rename them first.`), "error");
   }
-  const conflicts = names.filter((name) => state.remoteEntries.some((entry) => entry.name === name));
-  if (conflicts.length && state.preferences.confirmOverwrite) {
+  const destinationEntries = context
+    ? await invokeSftpWithReconnect("sftp_list", { id: record.id, path: destinationPath }, record.id)
+    : state.remoteEntries;
+  const conflicts = names.filter((name) => destinationEntries.some((entry) => entry.name === name));
+  if (conflicts.length && state.preferences.confirmOverwrite && !context?.overwriteConfirmed) {
     const preview = conflicts.slice(0, 5).join("、");
-    const suffix = conflicts.length > 5 ? ` 等 ${conflicts.length} 个文件` : "";
-    const overwrite = await appPrompt({ title: "覆盖远程文件", message: `远程目录中已存在 ${preview}${suffix}，是否全部覆盖？`, input: false, confirmText: "全部覆盖" });
+    const suffix = conflicts.length > 5 ? tr(` 等 ${conflicts.length} 个文件`, ` and ${conflicts.length - 5} more`) : "";
+    const overwrite = await appPrompt({ title: tr("覆盖远程文件", "Overwrite remote files"), message: tr(`远程目录中已存在 ${preview}${suffix}，是否全部覆盖？`, `${preview}${suffix} already exist in the remote folder. Overwrite all?`), input: false, confirmText: tr("全部覆盖", "Overwrite all") });
     if (!overwrite) return;
   }
+  if (detachedSftp) return sendSftpAction("upload", { localPaths, path: destinationPath, overwriteConfirmed: true });
   const jobs = localPaths.map((localPath, index) => ({
     id: crypto.randomUUID(), localPath, name: names[index], index,
   }));
   jobs.forEach((job) => queueTransfer(job.id, record.id, { name: job.name, kind: "上传", prefix: localPaths.length > 1 ? `${job.index + 1}/${localPaths.length} · ` : "" }));
-  if (state.transferActiveSlots.upload.size) toast("上传任务已加入并行队列");
+  if (state.transferActiveSlots.upload.size) toast(tr("上传任务已加入并行队列", "Upload tasks added to the parallel queue"));
   if (state.closing || !record.connected || !state.terminals.has(record.id)) {
     jobs.forEach((job) => { if (state.transferMeta.get(job.id)?.status === "queued") unregisterTransfer(job.id, "cancelled"); });
-    return toast("原会话已断开，上传任务已取消", "error");
+    return toast(tr("原会话已断开，上传任务已取消", "The session disconnected and queued uploads were cancelled"), "error");
   }
   state.activeTransferTerminalId = record.id;
   const started = performance.now();
@@ -3104,7 +3190,7 @@ async function uploadPaths(localPaths) {
       }
       state.transferPrefix = meta.prefix;
       state.transferStartedAt = performance.now();
-      if (state.activeId === record.id) setTransfer(`${state.transferPrefix}正在上传 ${job.name}…`, true);
+      if (state.activeId === record.id) setTransfer(tr(`${state.transferPrefix}正在上传 ${job.name}…`, `${state.transferPrefix}Uploading ${job.name}…`), true);
       const transferPromise = invoke("sftp_upload", { id: record.id, transferId: job.id, workerId: `upload-${workerIndex}`, localPath: job.localPath, remotePath: joinRemote(destinationPath, job.name) });
       registerTransfer(job.id, record.id, transferPromise);
       state.activeTransferPromise = transferPromise;
@@ -3126,10 +3212,10 @@ async function uploadPaths(localPaths) {
   try {
     if (failure) throw failure;
     const seconds = Math.max((performance.now() - started) / 1000, 0.01);
-    finishTransferBatch(`✓ 已上传 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`, record.id);
-    toast(`${completed} 个文件上传完成`, "success");
+    finishTransferBatch(tr(`✓ 已上传 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`, `✓ Uploaded ${completed} file(s) · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`), record.id);
+    toast(tr(`${completed} 个文件上传完成`, `${completed} file(s) uploaded`), "success");
     if (state.activeId === record.id) refreshRemote(destinationPath, false);
-  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? `上传已取消 · 已完成 ${completed}/${localPaths.length}` : `上传失败 · 已完成 ${completed}/${localPaths.length}：${String(error)}`, record.id); toast(String(error), "error"); }
+  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? tr(`上传已取消 · 已完成 ${completed}/${localPaths.length}`, `Upload cancelled · ${completed}/${localPaths.length} completed`) : tr(`上传失败 · 已完成 ${completed}/${localPaths.length}：${String(error)}`, `Upload failed · ${completed}/${localPaths.length} completed: ${String(error)}`), record.id); toast(String(error), "error"); }
   finally { updateSftpControls(); }
 }
 
@@ -3166,7 +3252,7 @@ function findInEditor(previous = false) {
   const start = previous ? Math.max(0, editor.selectionStart - 1) : editor.selectionEnd;
   let index = previous ? content.lastIndexOf(needle, start) : content.indexOf(needle, start);
   if (index < 0) index = previous ? content.lastIndexOf(needle) : content.indexOf(needle);
-  if (index < 0) return toast("未找到匹配内容");
+  if (index < 0) return toast(tr("未找到匹配内容", "No matches found"));
   editor.focus();
   editor.setSelectionRange(index, index + query.length);
   const lineHeight = Number.parseFloat(getComputedStyle(editor).lineHeight) || 20;
@@ -3232,7 +3318,7 @@ async function openRemoteEditor(item = state.selectedRemote) {
 
 async function closeRemoteEditor() {
   if (!el("remoteEditor").readOnly && el("remoteEditor").value !== state.editorOriginal) {
-    const accepted = await appPrompt({ title: "放弃修改", message: "远程文件有未保存的修改，确定关闭吗？", input: false, confirmText: "放弃修改" });
+    const accepted = await appPrompt({ title: tr("放弃修改", "Discard changes"), message: tr("远程文件有未保存的修改，确定关闭吗？", "The remote file has unsaved changes. Close it anyway?"), input: false, confirmText: tr("放弃修改", "Discard changes") });
     if (!accepted) return;
   }
   el("editorModal").classList.add("hidden");
@@ -3244,15 +3330,15 @@ async function closeRemoteEditor() {
 
 async function saveRemoteEditor() {
   const record = state.terminals.get(state.editorTerminalId);
-  if (!record?.connected || !state.editorPath) return toast("原会话已断开，无法保存", "error");
-  if (state.editorEncoding !== "utf8") return toast("二进制预览为只读，不能直接保存", "error");
+  if (!record?.connected || !state.editorPath) return toast(tr("原会话已断开，无法保存", "The original session is disconnected; the file cannot be saved"), "error");
+  if (state.editorEncoding !== "utf8") return toast(tr("二进制预览为只读，不能直接保存", "Binary previews are read-only and cannot be saved directly"), "error");
   const button = el("saveRemoteEditor");
   button.disabled = true;
     button.textContent = tr("正在保存…", "Saving…");
   try {
     await invokeSftpWithReconnect("sftp_write_text", { id: record.id, path: state.editorPath, content: el("remoteEditor").value }, record.id);
     state.editorOriginal = el("remoteEditor").value;
-    toast("远程文件已保存", "success");
+    toast(tr("远程文件已保存", "Remote file saved"), "success");
     button.textContent = tr("已保存", "Saved");
     setTimeout(() => { button.textContent = tr("保存到远端", "Save remotely"); button.disabled = el("remoteEditor").readOnly; }, 900);
     if (state.activeId === record.id) refreshRemote();
@@ -3263,25 +3349,26 @@ async function saveRemoteEditor() {
   }
 }
 
-async function downloadFile() {
-  const record = activeTerminal();
-  const items = selectedRemoteEntries();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  if (!items.length) return toast("请选择要下载的文件", "error");
-  const configuredDirectory = state.preferences.defaultDownloadDirectory;
-  const destination = configuredDirectory || (items.length === 1 && !items[0].isDir
+async function downloadFile(context = null) {
+  const record = context?.sessionId ? state.terminals.get(context.sessionId) : activeTerminal();
+  const items = context?.items || selectedRemoteEntries();
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
+  if (!items.length) return toast(tr("请选择要下载的文件", "Select files to download"), "error");
+  const configuredDirectory = context?.configuredDirectory ?? state.preferences.defaultDownloadDirectory;
+  const destination = context?.destination || configuredDirectory || (items.length === 1 && !items[0].isDir
     ? await save({ defaultPath: items[0].name })
-    : await open({ directory: true, multiple: false, title: `选择 ${items.length} 个文件的保存目录` }));
+    : await open({ directory: true, multiple: false, title: tr(`选择 ${items.length} 个文件的保存目录`, `Choose a folder for ${items.length} item(s)`) }));
   if (!destination) return;
+  if (detachedSftp) return sendSftpAction("download", { items, destination, configuredDirectory });
   const jobs = items.map((item, index) => ({
     id: crypto.randomUUID(), item, index,
-    localPath: (configuredDirectory || items.length > 1) ? joinLocal(destination, item.name) : destination,
+    localPath: (configuredDirectory || items.length > 1 || item.isDir) ? joinLocal(destination, item.name) : destination,
   }));
   jobs.forEach((job) => queueTransfer(job.id, record.id, { name: job.item.name, kind: "下载", total: job.item.isDir ? 0 : job.item.size, prefix: items.length > 1 ? `${job.index + 1}/${items.length} · ` : "" }));
-  if (state.transferActiveSlots.download.size) toast("下载任务已加入并行队列");
+  if (state.transferActiveSlots.download.size) toast(tr("下载任务已加入并行队列", "Download tasks added to the parallel queue"));
   if (state.closing || !record.connected || !state.terminals.has(record.id)) {
     jobs.forEach((job) => { if (state.transferMeta.get(job.id)?.status === "queued") unregisterTransfer(job.id, "cancelled"); });
-    return toast("原会话已断开，下载任务已取消", "error");
+    return toast(tr("原会话已断开，下载任务已取消", "The session disconnected and queued downloads were cancelled"), "error");
   }
   state.activeTransferTerminalId = record.id;
   const started = performance.now();
@@ -3292,7 +3379,7 @@ async function downloadFile() {
         unregisterTransfer(job.id, "cancelled");
         return { status: "cancelled", bytes: 0 };
       }
-      if (state.activeId === record.id) setTransfer(`${meta.prefix}正在下载 ${job.item.name}…`, true);
+      if (state.activeId === record.id) setTransfer(tr(`${meta.prefix}正在下载 ${job.item.name}…`, `${meta.prefix}Downloading ${job.item.name}…`), true);
       const transferPromise = invoke(job.item.isDir ? "sftp_download_tree" : "sftp_download", { id: record.id, transferId: job.id, workerId: `download-${workerIndex}`, remotePath: job.item.path, localPath: job.localPath });
       registerTransfer(job.id, record.id, transferPromise);
       state.activeTransferPromise = Promise.allSettled([...state.transferPromises.values()]);
@@ -3314,25 +3401,25 @@ async function downloadFile() {
   try {
     if (failure) throw failure;
     const seconds = Math.max((performance.now() - started) / 1000, 0.01);
-    finishTransferBatch(`✓ 已下载 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`, record.id);
-    toast(`${completed} 个文件下载完成`, "success");
-  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? `下载已取消 · 已完成 ${completed}/${items.length}` : `下载失败 · 已完成 ${completed}/${items.length}：${String(error)}`, record.id); toast(String(error), "error"); }
+    finishTransferBatch(tr(`✓ 已下载 ${completed} 个文件 · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`, `✓ Downloaded ${completed} item(s) · ${formatSize(totalBytes)} · ${formatSize(totalBytes / seconds)}/s`), record.id);
+    toast(tr(`${completed} 个文件下载完成`, `${completed} item(s) downloaded`), "success");
+  } catch (error) { finishTransferBatch(String(error) === "传输已取消" ? tr(`下载已取消 · 已完成 ${completed}/${items.length}`, `Download cancelled · ${completed}/${items.length} completed`) : tr(`下载失败 · 已完成 ${completed}/${items.length}：${String(error)}`, `Download failed · ${completed}/${items.length} completed: ${String(error)}`), record.id); toast(String(error), "error"); }
   finally { updateSftpControls(); }
 }
 
 async function createFolder() {
   const record = activeTerminal();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  const name = await appPrompt({ title: "新建文件夹", message: `将在 ${state.remotePath} 中创建`, value: "新建文件夹" });
-  if (!name?.trim() || name.includes("/") || [".", ".."].includes(name.trim())) return toast("目录名称无效", "error");
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
+  const name = await appPrompt({ title: tr("新建文件夹", "New folder"), message: tr(`将在 ${state.remotePath} 中创建`, `Create it in ${state.remotePath}`), value: tr("新建文件夹", "New folder") });
+  if (!name?.trim() || name.includes("/") || [".", ".."].includes(name.trim())) return toast(tr("目录名称无效", "Invalid folder name"), "error");
   try { await invokeSftpWithReconnect("sftp_mkdir", { id: record.id, path: joinRemote(state.remotePath, name.trim()) }, record.id); refreshRemote(); }
   catch (error) { toast(String(error), "error"); }
 }
 
 async function createRemoteFile() {
   const record = activeTerminal();
-  if (!record?.connected) return toast("请先连接 SSH 会话", "error");
-  const name = (await appPrompt({ title: "新建文件", message: `将在 ${state.remotePath} 中创建`, value: "新建文件.txt" }))?.trim();
+  if (!record?.connected) return toast(tr("请先连接 SSH 会话", "Connect an SSH session first"), "error");
+  const name = (await appPrompt({ title: tr("新建文件", "New file"), message: tr(`将在 ${state.remotePath} 中创建`, `Create it in ${state.remotePath}`), value: tr("新建文件.txt", "New file.txt") }))?.trim();
   if (!name || name.includes("/") || [".", ".."].includes(name)) return;
   try {
     await invokeSftpWithReconnect("sftp_write_text", { id: record.id, path: joinRemote(state.remotePath, name), content: "" }, record.id);
@@ -3343,8 +3430,8 @@ async function createRemoteFile() {
 async function removeRemote() {
   const record = activeTerminal();
   const items = selectedRemoteEntries();
-  if (!record?.connected || !items.length) return toast("请选择要删除的文件或目录", "error");
-  const accepted = await appPrompt({ title: "删除远程项目", message: `确定递归删除选中的 ${items.length} 项吗？此操作无法撤销。`, input: false, confirmText: "删除" });
+  if (!record?.connected || !items.length) return toast(tr("请选择要删除的文件或目录", "Select files or folders to delete"), "error");
+  const accepted = await appPrompt({ title: tr("删除远程项目", "Delete remote items"), message: tr(`确定递归删除选中的 ${items.length} 项吗？此操作无法撤销。`, `Recursively delete the selected ${items.length} item(s)? This cannot be undone.`), input: false, confirmText: tr("删除", "Delete") });
   if (!accepted) return;
   try { for (const item of items) await invokeSftpWithReconnect("sftp_remove", { id: record.id, path: item.path, isDir: item.isDir }, record.id); refreshRemote(); }
   catch (error) { toast(String(error), "error"); }
@@ -3353,13 +3440,13 @@ async function removeRemote() {
 async function renameRemote() {
   const record = activeTerminal();
   const item = state.selectedRemote;
-  if (!record?.connected || !item) return toast("请选择要重命名的文件或目录", "error");
-  const name = (await appPrompt({ title: "重命名", value: item.name }))?.trim();
+  if (!record?.connected || !item) return toast(tr("请选择要重命名的文件或目录", "Select a file or folder to rename"), "error");
+  const name = (await appPrompt({ title: tr("重命名", "Rename"), value: item.name }))?.trim();
   if (!name || name === item.name) return;
-  if (name.includes("/") || [".", ".."].includes(name)) return toast("名称无效", "error");
+  if (name.includes("/") || [".", ".."].includes(name)) return toast(tr("名称无效", "Invalid name"), "error");
   try {
     await invokeSftpWithReconnect("sftp_rename", { id: record.id, oldPath: item.path, newPath: joinRemote(state.remotePath, name) }, record.id);
-    toast("重命名完成", "success");
+    toast(tr("重命名完成", "Rename completed"), "success");
     await refreshRemote();
   } catch (error) { toast(String(error), "error"); }
 }
@@ -3367,14 +3454,14 @@ async function renameRemote() {
 async function chmodRemote() {
   const record = activeTerminal();
   const items = selectedRemoteEntries();
-  if (!record?.connected || !items.length) return toast("请选择文件或目录", "error");
+  if (!record?.connected || !items.length) return toast(tr("请选择文件或目录", "Select a file or folder"), "error");
   const current = ((items[0].permissions || 0) & 0o7777).toString(8).padStart(3, "0");
-  const value = (await appPrompt({ title: "修改权限", message: "请输入八进制权限值，例如 644、755", value: current }))?.trim();
+  const value = (await appPrompt({ title: tr("修改权限", "Change permissions"), message: tr("请输入八进制权限值，例如 644、755", "Enter an octal permission value, such as 644 or 755"), value: current }))?.trim();
   if (value == null || value === "") return;
-  if (!/^[0-7]{3,4}$/.test(value)) return toast("请输入 3 或 4 位八进制权限值", "error");
+  if (!/^[0-7]{3,4}$/.test(value)) return toast(tr("请输入 3 或 4 位八进制权限值", "Enter a 3- or 4-digit octal permission value"), "error");
   try {
     for (const item of items) await invokeSftpWithReconnect("sftp_chmod", { id: record.id, path: item.path, permissions: Number.parseInt(value, 8) }, record.id);
-    toast(`权限已修改为 ${value}`, "success");
+    toast(tr(`权限已修改为 ${value}`, `Permissions changed to ${value}`), "success");
     await refreshRemote();
   } catch (error) { toast(String(error), "error"); }
 }
@@ -3389,14 +3476,143 @@ async function showRemoteProperties() {
     const message = state.preferences.language === "en-US"
       ? `Path: ${item.path}\nType: ${item.isDir ? "Folder" : "File"}\nSize: ${formatSize(properties.size)}\nContents: ${properties.files} file(s), ${properties.directories} folder(s)\nOwner: ${item.owner || "—"}\nPermissions: ${permission}`
       : `路径：${item.path}\n类型：${item.isDir ? "文件夹" : "文件"}\n大小：${formatSize(properties.size)}\n内容：${properties.files} 个文件，${properties.directories} 个文件夹\n归属：${item.owner || "—"}\n权限：${permission}`;
-    await appPrompt({ title: item.isDir ? "文件夹属性" : "文件属性", message, input: false, confirmText: "关闭" });
+    await appPrompt({ title: item.isDir ? tr("文件夹属性", "Folder properties") : tr("文件属性", "File properties"), message, input: false, confirmText: tr("关闭", "Close") });
   } catch (error) { toast(String(error), "error"); }
 }
 
+function sendSftpAction(action, data = {}) {
+  return emitTo("main", "orbiterm-sftp-action", {
+    ...data, action, sessionId: detachedSftp.scopeId, label: appWindow.label,
+  });
+}
+
+function publishSftpTransfers() {
+  if (!isTauri || detachedSftp) return;
+  for (const [sessionId, tool] of detachedSftpWindows) {
+    if (!tool.label) continue;
+    const tasks = [...state.transferMeta].filter(([, task]) => task.terminalId === sessionId);
+    const connected = Boolean(state.terminals.get(sessionId)?.connected);
+    void emitTo(tool.label, "orbiterm-sftp-transfers", { tasks, connected }).catch(() => {});
+  }
+}
+
+async function openDetachedSftp() {
+  const record = activeTerminal();
+  if (!isTauri || !record?.connected || record.session.local) return;
+  const existing = detachedSftpWindows.get(record.id);
+  if (existing) {
+    if (!existing.label) return;
+    const toolWindow = await Window.getByLabel(existing.label);
+    if (toolWindow) { await toolWindow.show(); await toolWindow.setFocus(); setActiveDrawer(null); return; }
+    detachedSftpWindows.delete(record.id);
+  }
+  // Only public connection identity crosses windows; credentials stay in the main session.
+  const { id, name, host, username, port } = record.session;
+  const query = new URLSearchParams({ session: JSON.stringify({ id, name, host, username, port }), path: state.remotePath,
+    theme: resolvedAppTheme(), language: state.preferences.language });
+  const tool = { label: null };
+  detachedSftpWindows.set(record.id, tool);
+  try {
+    tool.label = await invoke("open_tool_window", { request: {
+      kind: "sftp", title: `SFTP · ${name || host} — Orbiterm`, query: query.toString(), scopeId: record.id,
+    } });
+    if (state.activeId === record.id) setActiveDrawer(null);
+    publishSftpTransfers();
+    const toolWindow = await Window.getByLabel(tool.label);
+    await toolWindow?.once("tauri://destroyed", () => detachedSftpWindows.delete(record.id));
+  } catch (error) {
+    detachedSftpWindows.delete(record.id);
+    toast(String(error), "error");
+  }
+}
+
+function initializeDetachedSftp() {
+  const params = new URLSearchParams(detachedSftp.query);
+  const session = JSON.parse(params.get("session"));
+  const id = detachedSftp.scopeId;
+  const path = params.get("path") || "/";
+  state.preferences.appTheme = params.get("theme") === "light" ? "light" : "dark";
+  state.preferences.language = params.get("language") || state.preferences.language;
+  state.activeId = id;
+  state.terminals.set(id, { id, session, connected: true, status: "connected", terminal: { cols: 0, rows: 0 },
+    sftpHistory: [path], sftpHistoryIndex: 0, sftpRequestId: 0 });
+  state.remotePaths.set(id, path);
+  state.remoteUiByTerminal.set(id, { path, entries: [], selected: null, selectedPaths: new Set(),
+    selectionAnchor: null, filter: "", sort: { key: "name", direction: "asc" }, renderLimit: state.preferences.sftpPageSize });
+  syncActiveRemoteUi(activeTerminal());
+  document.documentElement.classList.add("sftp-detached");
+  document.querySelector(".brand-tag").textContent = "SFTP";
+  document.title = `SFTP · ${session.name || session.host} — Orbiterm`;
+  setActiveDrawer("sftp");
+}
+
+async function installSftpWindowEvents() {
+  if (!isTauri) return;
+  if (detachedSftp) {
+    await listen("orbiterm-sftp-transfers", ({ payload }) => {
+      state.transferMeta = new Map(payload.tasks);
+      if (typeof payload.connected === "boolean") activeTerminal().connected = payload.connected;
+      updateSftpControls();
+      renderTransferTasks();
+      const pending = payload.tasks.filter(([, task]) => ["queued", "running"].includes(task.status)).length;
+      setTransfer(tr(`${pending} 个未完成任务`, `${pending} pending transfer(s)`), pending > 0);
+    });
+    await listen("orbiterm-sftp-result", ({ payload }) => {
+      if (payload.error) toast(payload.error, "error");
+      else if (payload.refresh && activeTerminal()?.connected) void refreshRemote();
+    });
+    await listen("orbiterm-app-theme", ({ payload }) => {
+      state.preferences.appTheme = payload.theme;
+      applyAppAppearance();
+    });
+    await listen("orbiterm-session-closed", () => {
+      activeTerminal().connected = false;
+      updateSftpControls();
+      toast(tr("原终端会话已关闭", "The terminal session has been closed"), "error");
+    });
+    await sendSftpAction("ready");
+    void refreshRemote();
+    return;
+  }
+  await listen("orbiterm-sftp-action", async ({ payload }) => {
+    const { action, sessionId, label, transferId } = payload;
+    const tool = detachedSftpWindows.get(sessionId);
+    if (!tool || !label?.startsWith(`tool-sftp-${sessionId}-`) || (tool.label && tool.label !== label)) return;
+    tool.label = label;
+    try {
+      if (action === "ready") { publishSftpTransfers(); return; }
+      if (action === "closed") {
+        detachedSftpWindows.delete(sessionId);
+        if (state.activeId === sessionId && !state.closing) toggleSftp(true);
+        return;
+      }
+      if (action === "cancel" || action === "pause") {
+        if (state.transferMeta.get(transferId)?.terminalId !== sessionId) return;
+        await (action === "cancel" ? cancelTransferTask(transferId) : toggleTransferPause(transferId));
+      } else if (action === "upload") await uploadPaths(payload.localPaths, payload);
+      else if (action === "download") await downloadFile(payload);
+      else if (action === "clear") {
+        for (const [id, task] of state.transferMeta) {
+          if (task.terminalId === sessionId && !["queued", "running"].includes(task.status)) {
+            state.transferMeta.delete(id);
+            state.transferTerminals.delete(id);
+          }
+        }
+        renderTransferTasks();
+      }
+      await emitTo(label, "orbiterm-sftp-result", { refresh: action === "upload" });
+    } catch (error) {
+      await emitTo(label, "orbiterm-sftp-result", { error: String(error) });
+    }
+  });
+}
+
 function toggleSftp(force) {
+  if (detachedSftp) { if (force === false) void requestAppClose(); return; }
   const record = activeTerminal();
   if (!record) return toast(tr("请先打开一个终端会话", "Please open a terminal session first"), "error");
   if (record.session.local) return toast(tr("SFTP 文件管理器仅用于远程 SSH 会话", "SFTP File Manager is available only for remote SSH sessions"), "error");
+  if (force !== false && detachedSftpWindows.has(record.id)) { void openDetachedSftp(); return; }
   const show = force ?? el("sftpPanel").classList.contains("hidden");
   setActiveDrawer(show ? "sftp" : null);
   requestAnimationFrame(() => { fitVisibleTerminals(); if (show && activeTerminal()?.connected) refreshRemote(); });
@@ -3410,14 +3626,24 @@ function setActiveDrawer(drawer) {
 
 function applyActiveDrawer() {
   const drawer = state.activeId ? state.drawerByTerminal.get(state.activeId) : null;
+  if (drawer) browserController?.close();
   const panels = { sftp: el("sftpPanel"), tail: el("tailPanel"), manual: el("manualPanel") };
   for (const [name, panel] of Object.entries(panels)) {
     const open = drawer === name;
+    if (open && panel.classList.contains("hidden")) {
+      if (name === "sftp") setSftpWidth(DEFAULT_PREFERENCES.sftpWidth);
+      else setDrawerWidth(name, DEFAULT_PREFERENCES.sftpWidth);
+    }
     panel.classList.toggle("hidden", !open);
     panel.toggleAttribute("inert", !open);
     panel.setAttribute("aria-hidden", String(!open));
   }
-  if (drawer !== "tail") { clearTimeout(state.tailTimer); state.tailTimer = null; }
+  if (drawer !== "tail") {
+    clearTimeout(state.tailTimer);
+    clearTimeout(state.tailSearchTimer);
+    state.tailTimer = null;
+    state.tailSearchTimer = null;
+  }
   el("openSftpTool")?.classList.toggle("on", drawer === "sftp");
   el("openTailTool")?.classList.toggle("on", drawer === "tail");
   el("openManualTool")?.classList.toggle("on", drawer === "manual");
@@ -3425,7 +3651,7 @@ function applyActiveDrawer() {
 }
 
 function renderTailFiles() {
-  el("tailFiles").innerHTML = state.tailEntries.length ? state.tailEntries.map((entry) => `<button data-tail-path="${escapeHtml(entry.path)}" data-dir="${entry.isDir}">${fileIcon(entry)}<b>${escapeHtml(entry.name)}</b>${entry.isDir ? "" : `<small>${formatSize(entry.size)}</small>`}</button>`).join("") : `<div>当前目录没有可访问的文件</div>`;
+  el("tailFiles").innerHTML = state.tailEntries.length ? state.tailEntries.map((entry) => `<button data-tail-path="${escapeHtml(entry.path)}" data-dir="${entry.isDir}">${fileIcon(entry)}<b>${escapeHtml(entry.name)}</b>${entry.isDir ? "" : `<small>${formatSize(entry.size)}</small>`}</button>`).join("") : `<div>${tr("当前目录没有可访问的文件", "No accessible files in this folder")}</div>`;
 }
 
 function showTailFiles(show) {
@@ -3493,13 +3719,14 @@ async function openTailPanel() {
   state.tailSearchIndex = -1;
   state.tailSearchMatches = [];
   state.tailSearchQuery = "";
+  state.tailSearchTruncated = false;
   el("tailMode").value = record.tailMode || "last";
   el("tailLines").value = record.tailCount || state.preferences.tailDefaultLines;
   el("tailFollow").checked = record.tailFollow !== false;
   el("pauseTail").textContent = state.tailPaused ? tr("继续", "Resume") : tr("暂停", "Pause");
   updateTailModeUi();
   renderTailOutput(false);
-  if (el("tailSearch").value.trim()) updateTailSearch(false);
+  if (el("tailSearch").value.trim()) scheduleTailSearch();
   showTailFiles(false);
   if (record.connected && record.tailFile && !record.tailPaused) refreshTail();
 }
@@ -3513,7 +3740,7 @@ function closeTailPanel() {
 async function refreshTail(reset = false) {
   const record = activeTerminal();
   const path = record?.tailFile || "";
-  if (!record?.connected || !path) return toast("请选择当前目录中的日志文件", "error");
+  if (!record?.connected || !path) return toast(tr("请选择当前目录中的日志文件", "Select a log file in the current folder"), "error");
   clearTimeout(state.tailTimer);
   el("pauseTail").disabled = false;
   let hasRemaining = false;
@@ -3536,7 +3763,7 @@ async function refreshTail(reset = false) {
       record.tailLines = limitTailLines(record, snapshotLines);
       if (snapshotLines.length > state.preferences.tailMaxLines) toast(tr(`日志内容过多，仅保留最近 ${state.preferences.tailMaxLines.toLocaleString()} 行`, `The log is large; only the latest ${state.preferences.tailMaxLines.toLocaleString()} lines are retained`));
       state.tailLines = record.tailLines;
-      if (el("tailSearch").value.trim()) updateTailSearch(false);
+      if (el("tailSearch").value.trim()) scheduleTailSearch();
       else renderTailOutput(true);
     } else {
       const append = await invokeSftpWithReconnect("sftp_read_append", { id: record.id, path, offset: record.tailOffset }, record.id);
@@ -3552,7 +3779,7 @@ async function refreshTail(reset = false) {
       if (append.content) {
         record.tailLines = limitTailLines(record, appendTextLines(record.tailLines, append.content));
         state.tailLines = record.tailLines;
-        if (el("tailSearch").value.trim()) updateTailSearch(false);
+        if (el("tailSearch").value.trim()) scheduleTailSearch();
         else renderTailOutput(false);
       }
     }
@@ -3619,21 +3846,23 @@ function renderTailOutput(forceBottom = false) {
 }
 
 function updateTailSearch(move = false, previous = false) {
+  clearTimeout(state.tailSearchTimer);
+  state.tailSearchTimer = null;
   const query = el("tailSearch").value.trim().toLowerCase();
   if (!query) {
     state.tailSearchIndex = -1;
     state.tailSearchMatches = [];
     state.tailSearchQuery = "";
+    state.tailSearchTruncated = false;
     el("tailSearchCount").textContent = "";
     renderTailOutput(false);
     return;
   }
   const queryChanged = query !== state.tailSearchQuery;
   state.tailSearchQuery = query;
-  state.tailSearchMatches = state.tailLines.reduce((matches, line, index) => {
-    if (line.toLowerCase().includes(query)) matches.push(index);
-    return matches;
-  }, []);
+  const { matches, truncated } = findLimitedLineMatches(state.tailLines, query, MAX_TAIL_SEARCH_MATCHES);
+  state.tailSearchMatches = matches;
+  state.tailSearchTruncated = truncated;
   if (!state.tailSearchMatches.length) {
     state.tailSearchIndex = -1;
     el("tailSearchCount").textContent = "0";
@@ -3645,8 +3874,31 @@ function updateTailSearch(move = false, previous = false) {
   else state.tailSearchIndex = Math.min(state.tailSearchIndex, state.tailSearchMatches.length - 1);
   const lineHeight = Number.parseFloat(getComputedStyle(el("tailOutput")).lineHeight) || 20.5;
   el("tailOutput").scrollTop = Math.max(0, state.tailSearchMatches[state.tailSearchIndex] * lineHeight - el("tailOutput").clientHeight / 2);
-  el("tailSearchCount").textContent = `${state.tailSearchIndex + 1}/${state.tailSearchMatches.length}`;
+  el("tailSearchCount").textContent = `${state.tailSearchIndex + 1}/${state.tailSearchMatches.length}${state.tailSearchTruncated ? "+" : ""}`;
   renderTailOutput(false);
+}
+
+async function toggleTransferPause(transferId) {
+  if (detachedSftp) return sendSftpAction("pause", { transferId });
+  const task = state.transferMeta.get(transferId);
+  if (!task || task.pausePending || !["queued", "running"].includes(task.status)) return;
+  const paused = !task.paused;
+  task.pausePending = true;
+  renderTransferTasks();
+  try {
+    if (task.status === "running") await invoke("pause_transfer", { transferId, paused });
+    if (["queued", "running"].includes(task.status)) task.paused = paused;
+  } finally {
+    task.pausePending = false;
+    renderTransferTasks();
+    pumpTransferQueue("upload");
+    pumpTransferQueue("download");
+  }
+}
+
+function scheduleTailSearch() {
+  clearTimeout(state.tailSearchTimer);
+  state.tailSearchTimer = setTimeout(() => updateTailSearch(false), TAIL_SEARCH_DEBOUNCE_MS);
 }
 
 async function refreshServerMonitor() {
@@ -3656,19 +3908,33 @@ async function refreshServerMonitor() {
 }
 
 function setSftpWidth(width, persist = false) {
-  const maxWidth = Math.max(280, window.innerWidth - 24);
+  if (detachedSftp) return;
+  const panel = el("sftpPanel");
+  const maxWidth = Math.max(0, panel.parentElement.clientWidth);
   const minWidth = Math.min(360, maxWidth);
   state.preferences.sftpWidth = Math.round(Math.max(minWidth, Math.min(width, maxWidth)));
-  el("sftpPanel").style.width = `${state.preferences.sftpWidth}px`;
+  panel.style.setProperty("--sftp-width", `${state.preferences.sftpWidth}px`);
+  panel.style.width = `${state.preferences.sftpWidth}px`;
   if (persist) savePreferences();
 }
 
+function setTransferHeight(height) {
+  const maximum = Math.max(80, el("sftpPanel").clientHeight - 280);
+  const value = Math.round(Math.max(80, Math.min(height, maximum)));
+  el("transferTasks").style.height = `${value}px`;
+  el("transferResize").setAttribute("aria-valuenow", String(value));
+  el("transferResize").setAttribute("aria-valuemin", "80");
+  el("transferResize").setAttribute("aria-valuemax", String(maximum));
+}
+
 function setDrawerWidth(type, width, persist = false) {
-  const maxWidth = Math.max(360, window.innerWidth - 24);
-  const value = Math.round(Math.max(420, Math.min(width, maxWidth)));
+  const panel = el(type === "tail" ? "tailPanel" : "manualPanel");
+  const maxWidth = Math.max(0, panel.parentElement.clientWidth);
+  const value = Math.round(Math.max(Math.min(360, maxWidth), Math.min(width, maxWidth)));
   const key = type === "tail" ? "tailWidth" : "manualWidth";
   state.preferences[key] = value;
-  el(type === "tail" ? "tailPanel" : "manualPanel").style.width = `${value}px`;
+  panel.style.setProperty("--tool-width", `${value}px`);
+  panel.style.width = `${value}px`;
   if (persist) savePreferences();
 }
 
@@ -3690,40 +3956,6 @@ function installDrawerResize(handle) {
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", stop);
     handle.addEventListener("pointercancel", stop);
-  });
-}
-
-function closeMenus() {
-  document.querySelectorAll(".menu-root.open").forEach((menu) => {
-    menu.classList.remove("open");
-    menu.querySelector(".menu-trigger")?.setAttribute("aria-expanded", "false");
-  });
-}
-
-function updateMenuStates() {
-  const record = activeTerminal();
-  const states = {
-    copy: !record?.terminal.hasSelection(),
-    paste: !record?.connected,
-    "select-all": !record,
-    find: !record,
-    reconnect: !record,
-    disconnect: !record?.connected,
-    "duplicate-terminal": !record,
-    "previous-terminal": state.terminals.size < 2,
-    "next-terminal": state.terminals.size < 2,
-    "reset-terminal": !record,
-    clear: !record,
-    "toggle-log": !record?.connected,
-    "toggle-sftp": !record?.connected || record.session.local,
-    "toggle-tail": !record?.connected || record.session.local,
-    "transfer-tasks": !record,
-    "close-terminal": !record,
-    upload: !record?.connected,
-    "export-sessions": !state.sessions.length,
-  };
-  Object.entries(states).forEach(([action, disabled]) => {
-    document.querySelectorAll(`[data-menu-action="${action}"]`).forEach((button) => { button.disabled = disabled; });
   });
 }
 
@@ -3822,7 +4054,6 @@ function runTerminalContextAction(action) {
 }
 
 async function runMenuAction(action) {
-  closeMenus();
   switch (action) {
     case "new-session": openSessionModal(); break;
     case "quick-connect": openSessionModal(null, "quick"); break;
@@ -3871,11 +4102,11 @@ function helpContents(section) {
   const contents = english ? {
     guide: ["User Guide", `<div class="help-hero"><span>›_</span><div><h2>Start working quickly</h2><p>Manage SSH sessions, local PowerShell, files and logs in one window.</p></div></div><div class="help-card-grid"><section><h3>1 · Connect</h3><p>Create an SSH session or double-click a saved session. Passwords are stored only in Windows Credential Manager when requested.</p></section><section><h3>2 · Work with tabs</h3><p>Right-click a tab to duplicate, disconnect, reconnect or close it. Each tab keeps its own SFTP and log drawer state.</p></section><section><h3>3 · Transfer files</h3><p>Open SFTP to drag files for upload, multi-select downloads, edit text files, inspect properties and permissions.</p></section><section><h3>4 · Inspect logs</h3><p>Choose a remote log, configure tail/follow, pause streaming and search by line number.</p></section></div><div class="help-tip"><b>Tip</b><span>Multi-line paste opens a compose pane before sending—review commands before they reach the shell.</span></div>`],
     shortcuts: ["Keyboard Shortcuts", `<div class="shortcut-groups"><section><h3>Sessions</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd></dt><dd>New SSH session</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd></dt><dd>Close current tab</dd><dt><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>]</kbd></dt><dd>Disconnect / close session</dd></dl></section><section><h3>Terminal</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>Copy selection</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd></dt><dd>Paste or open compose pane</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></dt><dd>Find in terminal</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>A</kbd></dt><dd>Select all terminal text</dd></dl></section><section><h3>Panels & window</h3><dl><dt><kbd>Ctrl</kbd><kbd>B</kbd></dt><dd>Toggle session manager</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>Toggle SFTP</dd><dt><kbd>F11</kbd></dt><dd>Toggle full screen</dd><dt><kbd>Esc</kbd></dt><dd>Close the active panel or dialog</dd></dl></section></div>`],
-    about: ["About Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">Version 0.1.0 · Tauri 2</p><p>A native Windows SSH, SFTP and local PowerShell workspace built with Rust and xterm.js.</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">Passwords are stored in Windows Credential Manager and are never written to session JSON.</p>`],
+    about: ["About Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">Version 0.1.4 · Tauri 2</p><p>A native Windows SSH, SFTP and local PowerShell workspace built with Rust and xterm.js.</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">Passwords are stored in Windows Credential Manager and are never written to session JSON.</p>`],
   } : {
     guide: ["使用说明", `<div class="help-hero"><span>›_</span><div><h2>快速开始工作</h2><p>在一个窗口中管理 SSH 会话、本地 PowerShell、文件与日志。</p></div></div><div class="help-card-grid"><section><h3>1 · 建立连接</h3><p>新建 SSH 会话，或双击左侧已保存会话。勾选记住密码后，仅保存到 Windows 凭据管理器。</p></section><section><h3>2 · 管理标签</h3><p>右键标签可复制同连接会话、断开、重新连接或关闭；每个标签独立保持 SFTP 与日志抽屉状态。</p></section><section><h3>3 · 传输文件</h3><p>打开 SFTP 后可拖拽上传、多选下载、预览编辑文本，并查看属性或修改权限。</p></section><section><h3>4 · 查看日志</h3><p>选择远程日志后可设置 tail/follow、暂停实时刷新，并按行搜索内容。</p></section></div><div class="help-tip"><b>提示</b><span>粘贴多行内容会先进入编辑区，确认无误后再发送到终端。</span></div>`],
     shortcuts: ["快捷键说明", `<div class="shortcut-groups"><section><h3>会话</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>T</kbd></dt><dd>新建 SSH 会话</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd></dt><dd>关闭当前标签</dd><dt><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>]</kbd></dt><dd>断开或关闭当前会话</dd></dl></section><section><h3>终端</h3><dl><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>复制选中内容</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd></dt><dd>粘贴或打开多行编辑区</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></dt><dd>在终端中查找</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>A</kbd></dt><dd>全选终端内容</dd></dl></section><section><h3>面板与窗口</h3><dl><dt><kbd>Ctrl</kbd><kbd>B</kbd></dt><dd>展开或折叠会话管理器</dd><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>打开或关闭 SFTP</dd><dt><kbd>F11</kbd></dt><dd>进入或退出全屏</dd><dt><kbd>Esc</kbd></dt><dd>关闭当前抽屉或弹窗</dd></dl></section></div>`],
-    about: ["关于 Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">版本 0.1.0 · Tauri 2</p><p>基于 Rust 与 xterm.js 构建的 Windows 原生 SSH、SFTP 和本地 PowerShell 工作台。</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">密码仅保存到 Windows 凭据管理器，不会写入会话 JSON。</p>`],
+    about: ["关于 Orbiterm", `<div class="about-mark">›_</div><h2>Orbiterm</h2><p class="about-version">版本 0.1.4 · Tauri 2</p><p>基于 Rust 与 xterm.js 构建的 Windows 原生 SSH、SFTP 和本地 PowerShell 工作台。</p><div class="about-features"><span>SSH</span><span>SFTP</span><span>ConPTY</span><span>UTF-8</span></div><p class="muted">密码仅保存到 Windows 凭据管理器，不会写入会话 JSON。</p>`],
   };
   return contents[section];
 }
@@ -3903,13 +4134,13 @@ function openHelpModal(section) {
 }
 
 async function exportSessions() {
-  if (!state.sessions.length) return toast("没有可导出的会话", "error");
+  if (!state.sessions.length) return toast(tr("没有可导出的会话", "There are no sessions to export"), "error");
   const path = await save({ defaultPath: "orbiterm-sessions.json", filters: [{ name: "Orbiterm 会话配置", extensions: ["json"] }] });
   if (!path) return;
   try {
     const sessions = state.sessions.map((session) => ({ ...session, rememberPassword: false }));
     await invoke("write_text_file", { path, content: JSON.stringify({ version: 1, sessions }, null, 2) });
-    toast(`已导出 ${state.sessions.length} 个会话`, "success");
+    toast(tr(`已导出 ${state.sessions.length} 个会话`, `Exported ${state.sessions.length} session(s)`), "success");
   } catch (error) { toast(String(error), "error"); }
 }
 
@@ -3925,13 +4156,13 @@ async function importSessions() {
     state.sessions.push(...valid);
     persistSessions();
     renderSessions();
-    toast(`已导入 ${valid.length} 个会话`, "success");
-  } catch (error) { toast(`导入失败：${String(error)}`, "error"); }
+    toast(tr(`已导入 ${valid.length} 个会话`, `Imported ${valid.length} session(s)`), "success");
+  } catch (error) { toast(tr(`导入失败：${String(error)}`, `Import failed: ${String(error)}`), "error"); }
 }
 
 function reconnectActiveTerminal() {
   const record = activeTerminal();
-  if (!record) return toast("没有可重连的会话");
+  if (!record) return toast(tr("没有可重连的会话", "There is no session to reconnect"));
   void reconnectTerminal(record.id);
 }
 
@@ -3941,6 +4172,7 @@ async function disconnectTerminal(id = state.activeId) {
   record.manualDisconnect = true;
   record.connected = false;
   record.stopped = true;
+  clearTimeout(record.readTimer);
   await invoke(record.session.local ? "local_terminal_close" : "ssh_disconnect", { id }).catch(() => {});
   updateTerminalState(record, "disconnected");
   record.terminal.writeln("\r\n\x1b[90m会话已手动断开\x1b[0m");
@@ -3961,16 +4193,16 @@ async function reconnectTerminal(id = state.activeId) {
 
 async function copyTerminalSelection() {
   const selection = activeTerminal()?.terminal.getSelection();
-  if (!selection) return toast("请先选择终端内容");
-  try { await navigator.clipboard.writeText(selection); }
-  catch (error) { toast(`复制失败：${String(error)}`, "error"); }
+  if (!selection) return toast(tr("请先选择终端内容", "Select terminal text first"));
+  try { await writeClipboardText(selection); }
+  catch (error) { toast(tr(`复制失败：${String(error)}`, `Copy failed: ${String(error)}`), "error"); }
 }
 
 async function pasteTerminalClipboard() {
   const record = activeTerminal();
-  if (!record?.connected) return toast("当前终端未连接");
+  if (!record?.connected) return toast(tr("当前终端未连接", "The current terminal is not connected"));
   try {
-    const text = await navigator.clipboard.readText();
+    const text = await readClipboardText();
     const lineCount = text ? text.split(/\r\n|\r|\n/).length : 0;
     if (state.preferences.confirmMultiLinePaste && lineCount > 1) {
       el("pasteEditor").value = text;
@@ -3980,7 +4212,7 @@ async function pasteTerminalClipboard() {
     }
     record.terminal.paste(text);
     record.terminal.focus();
-  } catch (error) { toast(`粘贴失败：${String(error)}`, "error"); }
+  } catch (error) { toast(tr(`粘贴失败：${String(error)}`, `Paste failed: ${String(error)}`), "error"); }
 }
 
 function setPastePanelOpen(open, record = activeTerminal()) {
@@ -4009,16 +4241,21 @@ if (isTauri) {
 }
 void syncMaximizeButton();
 el("closePastePanel").addEventListener("click", () => setPastePanelOpen(false));
-el("copyPasteText").addEventListener("click", async () => { await navigator.clipboard.writeText(el("pasteEditor").value); toast("多行文本已复制", "success"); });
+el("copyPasteText").addEventListener("click", async () => { await writeClipboardText(el("pasteEditor").value); toast(tr("多行文本已复制", "Multiline text copied"), "success"); });
 el("sendPasteText").addEventListener("click", () => {
   const record = activeTerminal();
-  if (!record?.connected) return toast("当前终端未连接", "error");
+  if (!record?.connected) return toast(tr("当前终端未连接", "The current terminal is not connected"), "error");
   const source = el("pasteEditor").value;
   const text = el("pasteJoinLines").checked ? source.replace(/\r\n|\r|\n/g, " ") : source;
   record.terminal.paste(text);
   setPastePanelOpen(false, record);
 });
 async function requestAppClose() {
+  if (detachedSftp) {
+    await sendSftpAction("closed");
+    await invoke("close_current_tool_window");
+    return;
+  }
   if (state.closing) return;
   state.closing = true;
   await captureWindowBounds().catch(() => {});
@@ -4036,7 +4273,7 @@ async function requestAppClose() {
     }
   }
   if (pendingTransferIds.length) {
-    const accepted = await appPrompt({ title: "退出 Orbiterm", message: "仍有文件正在传输。退出将取消传输，是否继续？", input: false, confirmText: "退出" });
+    const accepted = await appPrompt({ title: tr("退出 Orbiterm", "Exit Orbiterm"), message: tr("仍有文件正在传输。退出将取消传输，是否继续？", "File transfers are still active. Exiting will cancel them. Continue?"), input: false, confirmText: tr("退出", "Exit") });
     if (!accepted) {
       state.closing = false;
       el("closeWindow").disabled = false;
@@ -4076,6 +4313,7 @@ el("emptyNew").addEventListener("click", () => void openSessionModal());
 el("addSession").addEventListener("click", () => void openSessionModal());
 el("collapseSidebar").addEventListener("click", () => setSidebarCollapsed(!document.querySelector(".sidebar").classList.contains("collapsed")));
 el("expandSidebar").addEventListener("click", () => setSidebarCollapsed(false));
+el("expandEmptySidebar").addEventListener("click", () => setSidebarCollapsed(false));
 document.querySelectorAll("[data-close-modal]").forEach((node) => node.addEventListener("click", closeSessionModal));
 el("sessionModal").addEventListener("mousedown", (event) => { if (event.target === el("sessionModal")) closeSessionModal(); });
 el("authType").addEventListener("change", updateAuthFields);
@@ -4117,8 +4355,8 @@ el("helpModalBody").addEventListener("click", async (event) => {
   }
   const copyButton = event.target.closest("[data-copy-command]");
   if (copyButton) {
-    await navigator.clipboard.writeText(copyButton.dataset.copyCommand);
-    toast("命令已复制", "success");
+    await writeClipboardText(copyButton.dataset.copyCommand);
+    toast(tr("命令已复制", "Command copied"), "success");
   }
 });
 function applySettingsFromControls() {
@@ -4247,8 +4485,8 @@ el("commandList").addEventListener("click", (event) => {
 el("commandDetail").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-copy-command]");
   if (!button) return;
-  await navigator.clipboard.writeText(button.dataset.copyCommand);
-  toast("命令已复制", "success");
+  await writeClipboardText(button.dataset.copyCommand);
+  toast(tr("命令已复制", "Command copied"), "success");
 });
 el("closeFind").addEventListener("click", closeFindBar);
 el("findNext").addEventListener("click", () => findInTerminal(false));
@@ -4331,7 +4569,6 @@ el("wsList").addEventListener("contextmenu", (event) => {
   if (!workspace) return;
   event.preventDefault();
   activateTerminal(workspace.dataset.terminalId);
-  closeMenus();
   hideTerminalContextMenu();
   state.tabContextId = workspace.dataset.terminalId;
   positionPopup(el("tabContextMenu"), event.clientX, event.clientY);
@@ -4344,7 +4581,6 @@ el("sessionList").addEventListener("contextmenu", (event) => {
   const heading = event.target.closest("[data-session-group]");
   const item = event.target.closest(".session-item");
   event.preventDefault();
-  closeMenus();
   hideTerminalContextMenu();
   hideTabContextMenu();
   hideGroupMenus();
@@ -4378,7 +4614,7 @@ el("sessionList").addEventListener("click", async (event) => {
   if (button?.dataset.action && item) {
     const session = state.sessions.find((s) => s.id === item.dataset.sessionId);
     if (button.dataset.action === "edit") openSessionModal(session);
-    if (button.dataset.action === "delete" && await appPrompt({ title: "删除会话", message: `确定删除会话“${session.name}”吗？`, input: false, confirmText: "删除" })) {
+    if (button.dataset.action === "delete" && await appPrompt({ title: tr("删除会话", "Delete session"), message: tr(`确定删除会话“${session.name}”吗？`, `Delete session “${session.name}”?`), input: false, confirmText: tr("删除", "Delete") })) {
       await invoke("credential_delete", { sessionId: session.id }).catch(() => {});
       state.sessions = state.sessions.filter((s) => s.id !== session.id); persistSessions(); renderSessions();
     }
@@ -4388,6 +4624,7 @@ el("sessionList").addEventListener("click", async (event) => {
   await connectSavedSession(state.sessions.find((session) => session.id === item.dataset.sessionId));
 });
 el("closeSftp").addEventListener("click", () => toggleSftp(false));
+el("detachSftp").addEventListener("click", () => void openDetachedSftp());
 el("openSftpTool").addEventListener("click", () => toggleSftp());
 el("openManualTool").addEventListener("click", (event) => {
   event.preventDefault();
@@ -4409,15 +4646,6 @@ el("newGroupInForm")?.addEventListener("click", async () => {
   }
 });
 el("reconnectTool").addEventListener("click", () => runMenuAction("reconnect"));
-el("moreTool").addEventListener("click", (event) => {
-  event.stopPropagation();
-  if (!state.activeId) return;
-  const rect = el("moreTool").getBoundingClientRect();
-  el("tabContextMenu").style.left = `${rect.right - 230}px`;
-  el("tabContextMenu").style.top = `${rect.bottom + 6}px`;
-  el("tabContextMenu").classList.remove("hidden");
-  state.tabContextId = state.activeId;
-});
 el("paletteTrigger").addEventListener("click", openPalette);
 el("paletteOverlay").addEventListener("mousedown", (event) => { if (event.target === event.currentTarget) closePalette(); });
 el("paletteInput").addEventListener("input", () => { palSel = 0; renderPalette(); });
@@ -4513,7 +4741,7 @@ el("tailFiles").addEventListener("dblclick", (event) => {
     refreshTail();
   }
 });
-el("tailSearch").addEventListener("input", () => updateTailSearch(false));
+el("tailSearch").addEventListener("input", scheduleTailSearch);
 el("tailSearchNext").addEventListener("click", () => updateTailSearch(true, false));
 el("tailSearchPrevious").addEventListener("click", () => updateTailSearch(true, true));
 el("tailOutput").addEventListener("scroll", () => {
@@ -4573,8 +4801,8 @@ el("remoteForward").addEventListener("click", () => {
   refreshRemote(record.sftpHistory[record.sftpHistoryIndex], false);
 });
 el("copyRemotePath").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(state.remotePath); toast("远程路径已复制", "success"); }
-  catch (error) { toast(`复制路径失败：${String(error)}`, "error"); }
+  try { await writeClipboardText(state.remotePath); toast(tr("远程路径已复制", "Remote path copied"), "success"); }
+  catch (error) { toast(tr(`复制路径失败：${String(error)}`, `Failed to copy the path: ${String(error)}`), "error"); }
 });
 el("uploadFile").addEventListener("click", uploadFile);
 el("downloadFile").addEventListener("click", downloadFile);
@@ -4591,6 +4819,11 @@ el("cancelTransfer").addEventListener("click", async () => {
   if (state.activeId === terminalId) el("transferText").textContent = localizeRuntimeText("传输已取消");
 });
 el("transferTaskList").addEventListener("click", async (event) => {
+  const pause = event.target.closest("[data-pause-transfer-id]");
+  if (pause) {
+    await toggleTransferPause(pause.dataset.pauseTransferId).catch((error) => toast(String(error), "error"));
+    return;
+  }
   const button = event.target.closest("[data-cancel-transfer-id]");
   if (!button) return;
   const transferId = button.dataset.cancelTransferId;
@@ -4600,6 +4833,7 @@ el("transferTaskList").addEventListener("click", async (event) => {
   await cancelTransferTask(transferId).catch((error) => toast(String(error), "error"));
 });
 el("clearTransferTasks").addEventListener("click", () => {
+  if (detachedSftp) { void sendSftpAction("clear"); return; }
   [...state.transferMeta.entries()].forEach(([id, task]) => {
     if (task.terminalId === state.activeId && !["queued", "running"].includes(task.status)) {
       state.transferMeta.delete(id);
@@ -4669,6 +4903,33 @@ el("sftpResize").addEventListener("pointerdown", (event) => {
   handle.addEventListener("pointerup", stop);
   handle.addEventListener("pointercancel", stop);
 });
+el("transferResize").addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  const handle = event.currentTarget;
+  handle.setPointerCapture(event.pointerId);
+  const startY = event.clientY;
+  const startHeight = el("transferTasks").getBoundingClientRect().height;
+  const move = (pointer) => setTransferHeight(startHeight + startY - pointer.clientY);
+  const stop = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", stop);
+    handle.removeEventListener("pointercancel", stop);
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+});
+el("transferResize").addEventListener("keydown", (event) => {
+  if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  setTransferHeight(el("transferTasks").getBoundingClientRect().height + (event.key === "ArrowUp" ? 20 : -20));
+});
+new ResizeObserver(() => {
+  setSftpWidth(state.preferences.sftpWidth);
+  setDrawerWidth("tail", state.preferences.tailWidth);
+  setDrawerWidth("manual", state.preferences.manualWidth);
+  if (el("transferTasks").style.height) setTransferHeight(el("transferTasks").getBoundingClientRect().height);
+}).observe(document.querySelector(".terminal-pane"));
 document.querySelector(".terminal-stack").addEventListener("click", (event) => {
   const unsplit = event.target.closest("[data-unsplit]");
   if (unsplit) {
@@ -4688,14 +4949,12 @@ document.querySelector(".terminal-stack").addEventListener("contextmenu", (event
     void pasteTerminalClipboard();
     return;
   }
-  closeMenus();
   showTerminalContextMenu(event.clientX, event.clientY);
 });
 el("terminalTabs").addEventListener("contextmenu", (event) => {
   const tab = event.target.closest(".tab");
   if (!tab) return;
   event.preventDefault();
-  closeMenus();
   hideTerminalContextMenu();
   state.tabContextId = tab.dataset.terminalId;
   positionPopup(el("tabContextMenu"), event.clientX, event.clientY);
@@ -4741,55 +5000,7 @@ document.querySelectorAll("[data-lib-action]").forEach((item) => item.addEventLi
 document.querySelectorAll("[data-terminal-context-action]").forEach((item) => {
   item.addEventListener("click", () => runTerminalContextAction(item.dataset.terminalContextAction));
 });
-document.querySelectorAll(".menu-trigger").forEach((trigger) => {
-  trigger.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const root = trigger.closest(".menu-root");
-    const wasOpen = root.classList.contains("open");
-    closeMenus();
-    root.classList.toggle("open", !wasOpen);
-    trigger.setAttribute("aria-expanded", String(!wasOpen));
-    if (!wasOpen) {
-      updateMenuStates();
-      root.querySelector(".menu-popup button:not(:disabled)")?.focus({ preventScroll: true });
-    }
-  });
-  trigger.closest(".menu-root").addEventListener("mouseenter", () => {
-    if (document.querySelector(".menu-root.open")) {
-      closeMenus();
-      trigger.closest(".menu-root").classList.add("open");
-      trigger.setAttribute("aria-expanded", "true");
-      updateMenuStates();
-    }
-  });
-  trigger.addEventListener("keydown", (event) => {
-    if (!["ArrowDown", "Enter", " "].includes(event.key)) return;
-    event.preventDefault();
-    closeMenus();
-    const root = trigger.closest(".menu-root");
-    root.classList.add("open");
-    trigger.setAttribute("aria-expanded", "true");
-    updateMenuStates();
-    root.querySelector(".menu-popup button:not(:disabled)")?.focus();
-  });
-});
-document.querySelectorAll(".menu-popup").forEach((popup) => popup.addEventListener("keydown", (event) => {
-  const items = [...popup.querySelectorAll("button:not(:disabled)")];
-  const index = items.indexOf(document.activeElement);
-  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-    event.preventDefault();
-    items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
-  }
-  if (event.key === "Escape") {
-    event.preventDefault();
-    const trigger = popup.closest(".menu-root").querySelector(".menu-trigger");
-    closeMenus();
-    trigger.focus();
-  }
-}));
-document.querySelectorAll("[data-menu-action]").forEach((item) => item.addEventListener("click", () => runMenuAction(item.dataset.menuAction)));
 document.addEventListener("click", (event) => {
-  closeMenus();
   if (!event.target.closest("#terminalContextMenu")) hideTerminalContextMenu();
   if (!event.target.closest("#tabContextMenu")) hideTabContextMenu();
   if (!event.target.closest("#groupContextMenu,#sessionLibContextMenu")) hideGroupMenus();
@@ -4803,6 +5014,11 @@ window.addEventListener("resize", () => {
   fitVisibleTerminals();
 });
 window.addEventListener("keydown", (event) => {
+  if (detachedSftp) {
+    if (event.key === "F5") { event.preventDefault(); void refreshRemote(); }
+    if (event.key === "F12") { event.preventDefault(); void invoke("open_current_devtools"); }
+    return;
+  }
   const key = event.key.toLowerCase();
   const inTerminal = Boolean(event.target.closest?.(".xterm"));
   const inFormField = Boolean(event.target.closest?.("input, textarea, select, [contenteditable='true']")) && !inTerminal;
@@ -4829,14 +5045,14 @@ window.addEventListener("keydown", (event) => {
   else if (event.key === "Escape" && !el("editorModal").classList.contains("hidden")) void closeRemoteEditor();
   else if (event.key === "Escape" && ["sftp", "tail", "manual"].includes(state.drawerByTerminal.get(state.activeId))) setActiveDrawer(null);
   else if (event.key === "Escape" && !el("sessionModal").classList.contains("hidden")) closeSessionModal();
-  else if (event.key === "Escape") { closeMenus(); hideTerminalContextMenu(); hideTabContextMenu(); hideGroupMenus(); hideSftpMenus(); }
+  else if (event.key === "Escape") { hideTerminalContextMenu(); hideTabContextMenu(); hideGroupMenus(); hideSftpMenus(); }
   if (event.key === "F5" && !el("sftpPanel").classList.contains("hidden")) { event.preventDefault(); refreshRemote(); }
 });
 
 if (isTauri) {
   appWindow.onDragDropEvent(({ payload }) => {
     if (payload.type === "drop") {
-      if (el("sftpPanel").classList.contains("hidden")) return toast("请先打开 SFTP 文件管理器", "error");
+      if (el("sftpPanel").classList.contains("hidden")) return toast(tr("请先打开 SFTP 文件管理器", "Open the SFTP file manager first"), "error");
       void uploadPaths(payload.paths);
     }
   }).catch(() => {});
@@ -4856,16 +5072,25 @@ if (isTauri) {
   }).catch(() => {});
 }
 
-renderSessions();
+if (!detachedSftp) browserController = createBrowserController({
+  panel: el("browserPanel"), button: el("openBrowserTool"), isTauri, tr, onLayout: fitVisibleTerminals,
+  onOpen: () => setActiveDrawer(null),
+  getDefaultWidth: () => DEFAULT_PREFERENCES.sftpWidth,
+});
+if (detachedSftp) initializeDetachedSftp();
+else renderSessions();
 applyAppAppearance();
 updateTerminalSchemePicker();
 updateActiveStatus();
-setSftpWidth(state.preferences.sftpWidth);
-setDrawerWidth("tail", state.preferences.tailWidth);
-setDrawerWidth("manual", state.preferences.manualWidth);
+setSftpWidth(DEFAULT_PREFERENCES.sftpWidth);
+setDrawerWidth("tail", DEFAULT_PREFERENCES.sftpWidth);
+setDrawerWidth("manual", DEFAULT_PREFERENCES.sftpWidth);
 document.querySelectorAll("[data-resize-drawer]").forEach(installDrawerResize);
 updateSftpControls();
 updateTailModeUi();
-setSidebarCollapsed(Boolean(state.preferences.sidebarCollapsed));
-void revealMainWindow();
-void restoreOpenSessions();
+if (!detachedSftp) {
+  setSidebarCollapsed(Boolean(state.preferences.sidebarCollapsed));
+  void revealMainWindow();
+  void restoreOpenSessions();
+}
+void installSftpWindowEvents();

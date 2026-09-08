@@ -1,0 +1,4 @@
+[env]
+# openssl-sys parses MSVC preprocessor output as UTF-8, including #line paths.
+# Without this, a Chinese checkout path produces invalid UTF-8 on Windows.
+CFLAGS_x86_64_pc_windows_msvc = "/utf-8"

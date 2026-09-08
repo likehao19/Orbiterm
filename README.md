@@ -7,7 +7,7 @@
 ## 已实现
 
 - 密码、OpenSSH 私钥和 SSH Agent 认证
-- 首次连接主机指纹确认，已知主机指纹变更告警
+- 首次连接自动记录主机指纹，已知主机指纹变更时拒绝连接
 - 真实交互式 PTY、多终端标签、终端自适应尺寸
 - SSH keepalive、断线/退出码识别、后台非阻塞 I/O 和兼容 vim 的 bracketed paste
 - 多行粘贴安全确认、可选会话日志记录
@@ -22,6 +22,10 @@
 - 复制、粘贴、清屏、重连和常用快捷键
 
 ## 开发与构建
+
+SSH 在开发和发布构建中统一使用静态 OpenSSL 后端，支持 RSA、Ed25519、ECDSA 的 OpenSSH/PEM 私钥及加密私钥。私钥按内容识别，支持中文路径；PuTTY PPK 目前会提示使用 PuTTYgen 导出为 OpenSSH 格式，不自动转换。
+
+Windows 编译需要原生 [Strawberry Perl](https://strawberryperl.com/)（Git 自带的 MSYS Perl 不适用）。`npm run tauri` 自动查找 PATH、默认安装位置及项目本地的便携工具链；也可以通过 `OPENSSL_SRC_PERL` 指定 `perl.exe`。仅编译需要 Perl，安装后的用户不需要安装 Perl 或 OpenSSL。
 
 ```powershell
 npm install
@@ -53,3 +57,5 @@ npm test
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+私钥认证回归测试（本机临时 SSH 服务、随机测试密钥，不使用真实服务器）：安装 Python `paramiko` 和 `cryptography` 后运行 `python scripts/test-private-key-auth.py`。直接使用 Cargo 时，Windows 需将原生 Perl 加入 PATH 或设置 `OPENSSL_SRC_PERL`。测试覆盖 RSA/Ed25519/ECDSA、PEM/PKCS#8、加密与未加密、错误口令、中文路径和 BOM/CRLF。

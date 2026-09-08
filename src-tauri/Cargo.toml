@@ -1,6 +1,6 @@
 [package]
 name = "orbiterm"
-version = "0.1.0"
+version = "0.1.4"
 description = "A modern SSH and SFTP desktop client"
 authors = ["Orbiterm contributors"]
 edition = "2021"
@@ -16,9 +16,10 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-ssh2 = "0.9"
+ssh2 = { version = "0.9", features = ["openssl-on-win32", "vendored-openssl"] }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 portable-pty = "0.9"
 serde_json = "1"
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = ["devtools", "unstable"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"

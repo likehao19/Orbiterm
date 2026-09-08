@@ -10,7 +10,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc, Mutex,
     },
@@ -18,6 +18,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+
+mod ssh_auth;
+mod transfer_control;
+mod browser;
+use transfer_control::TransferControl;
 
 static TOOL_WINDOW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_PENDING_TERMINAL_INPUT: usize = 1024 * 1024;
@@ -34,7 +39,7 @@ struct AppState {
     transfer_sftp_connections: Mutex<HashMap<String, SharedSftp>>,
     monitor_connections: Mutex<HashMap<String, SharedSession>>,
     user_names: Mutex<HashMap<String, HashMap<u32, String>>>,
-    transfers: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    transfers: Mutex<HashMap<String, Arc<TransferControl>>>,
     logs: Mutex<HashMap<String, File>>,
     tool_window_requests: Mutex<HashMap<String, ToolWindowRequest>>,
 }
@@ -293,6 +298,7 @@ fn open_session(
         .map_err(|error| format!("无法复制 SSH Socket：{error}"))?;
 
     let mut session = Session::new().map_err(|error| format!("SSH 初始化失败：{error}"))?;
+    ssh_auth::configure_host_key_preference(&session)?;
     session.set_timeout(timeout.as_millis().min(u128::from(u32::MAX)) as u32);
     session.set_tcp_stream(tcp);
     session
@@ -312,8 +318,8 @@ fn local_terminal_open(
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows: rows.max(3),
+            cols: cols.max(20),
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -467,14 +473,17 @@ fn local_terminal_resize(
     rows: u16,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if cols < 20 || rows < 3 {
+        return Err("忽略过小的终端尺寸".to_string());
+    }
     let terminal = get_local_terminal(&id, &state)?;
     let result = terminal
         .lock()
         .map_err(|_| "本地终端已损坏".to_string())?
         .master
         .resize(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -555,14 +564,12 @@ fn authenticate(session: &Session, auth: &AuthConfig) -> Result<(), String> {
                 .as_deref()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "请选择私钥文件".to_string())?;
-            session
-                .userauth_pubkey_file(
-                    &auth.username,
-                    None,
-                    Path::new(key),
-                    auth.passphrase.as_deref().filter(|value| !value.is_empty()),
-                )
-                .map_err(|error| format!("私钥认证失败：{error}"))?;
+            ssh_auth::authenticate(
+                session,
+                &auth.username,
+                Path::new(key),
+                auth.passphrase.as_deref(),
+            )?;
         }
         "agent" => {
             let mut agent = session
@@ -657,7 +664,7 @@ async fn ssh_connect(
                 .map_err(|error| format!("无法创建终端通道：{error}"))?;
             let terminal = request.terminal_type.as_deref().unwrap_or("xterm-256color");
             channel
-                .request_pty(terminal, None, Some((request.cols, request.rows, 0, 0)))
+                .request_pty(terminal, None, Some((request.cols.max(20), request.rows.max(3), 0, 0)))
                 .map_err(|error| format!("无法申请 PTY：{error}"))?;
             let _ = channel.setenv("TERM", terminal);
             let _ = channel.setenv("COLORTERM", "truecolor");
@@ -833,6 +840,9 @@ async fn ssh_write(id: String, data: Vec<u8>, state: State<'_, AppState>) -> Res
 
 #[tauri::command]
 fn ssh_resize(id: String, cols: u32, rows: u32, state: State<'_, AppState>) -> Result<(), String> {
+    if cols < 20 || rows < 3 {
+        return Err("忽略过小的终端尺寸".to_string());
+    }
     let connection = get_connection(&id, &state)?;
     let result = connection
         .lock()
@@ -1401,14 +1411,14 @@ fn remove_transfer_sftp(key: &str, state: &State<'_, AppState>) -> Result<(), St
 fn register_transfer_cancel(
     transfer_id: &str,
     state: &State<'_, AppState>,
-) -> Result<Arc<AtomicBool>, String> {
+) -> Result<Arc<TransferControl>, String> {
     let mut transfers = state
         .transfers
         .lock()
         .map_err(|_| "传输管理器已损坏".to_string())?;
     Ok(transfers
         .entry(transfer_id.to_string())
-        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .or_insert_with(|| Arc::new(TransferControl::default()))
         .clone())
 }
 
@@ -1731,9 +1741,7 @@ async fn sftp_upload(
                 let mut transferred = 0u64;
                 let mut last_emit = Instant::now();
                 loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("传输已取消".to_string());
-                    }
+                    cancel.checkpoint()?;
                     let count = source
                         .read(&mut buffer)
                         .map_err(|error| format!("读取本地文件失败：{error}"))?;
@@ -1757,6 +1765,7 @@ async fn sftp_upload(
                         last_emit = Instant::now();
                     }
                 }
+                cancel.checkpoint()?;
                 target
                     .flush()
                     .map_err(|error| format!("刷新远程文件失败：{error}"))?;
@@ -1832,9 +1841,7 @@ async fn sftp_download(
                 let mut transferred = 0u64;
                 let mut last_emit = Instant::now();
                 loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("传输已取消".to_string());
-                    }
+                    cancel.checkpoint()?;
                     let count = source
                         .read(&mut buffer)
                         .map_err(|error| format!("下载失败：{error}"))?;
@@ -1861,6 +1868,7 @@ async fn sftp_download(
                 target
                     .flush()
                     .map_err(|error| format!("刷新本地文件失败：{error}"))?;
+                cancel.checkpoint()?;
                 drop(target);
                 replace_local_file(&temp, &local, &backup)?;
                 Ok(transferred)
@@ -1906,10 +1914,8 @@ async fn sftp_download_tree(
             let sftp = sftp
                 .lock()
                 .map_err(|_| "传输 SFTP 连接已损坏".to_string())?;
-            fn tree_size(sftp: &Sftp, remote: &Path, cancel: &AtomicBool) -> Result<u64, String> {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("传输已取消".to_string());
-                }
+            fn tree_size(sftp: &Sftp, remote: &Path, cancel: &TransferControl) -> Result<u64, String> {
+                cancel.checkpoint()?;
                 let stat = sftp
                     .lstat(remote)
                     .map_err(|error| format!("无法读取远程项目：{error}"))?;
@@ -1939,14 +1945,12 @@ async fn sftp_download_tree(
                 remote: &Path,
                 local: &Path,
                 transfer_id: &str,
-                cancel: &AtomicBool,
+                cancel: &TransferControl,
                 app: &AppHandle,
                 transferred: &mut u64,
                 total: u64,
             ) -> Result<(), String> {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("传输已取消".to_string());
-                }
+                cancel.checkpoint()?;
                 let stat = sftp
                     .lstat(remote)
                     .map_err(|error| format!("无法读取远程项目：{error}"))?;
@@ -1993,9 +1997,7 @@ async fn sftp_download_tree(
                 let mut buffer = vec![0u8; 256 * 1024];
                 let mut last_emit = Instant::now();
                 loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("传输已取消".to_string());
-                    }
+                    cancel.checkpoint()?;
                     let count = source
                         .read(&mut buffer)
                         .map_err(|error| format!("下载失败：{error}"))?;
@@ -2057,7 +2059,7 @@ async fn sftp_download_tree(
                 &app,
                 &mut transferred,
                 total,
-            );
+            ).and_then(|()| cancel.checkpoint());
             match download_result {
                 Ok(()) => {
                     replace_local_directory(&temp, &local, &backup)?;
@@ -2204,15 +2206,20 @@ fn cancel_transfer(transfer_id: String, state: State<'_, AppState>) -> Result<()
         .map_err(|_| "传输管理器已损坏".to_string())?;
     transfers
         .entry(transfer_id)
-        .or_insert_with(|| Arc::new(AtomicBool::new(true)))
-        .store(true, Ordering::Relaxed);
-    Ok(())
+        .or_insert_with(|| Arc::new(TransferControl::default()))
+        .cancel()
+}
+
+#[tauri::command]
+fn pause_transfer(transfer_id: String, paused: bool, state: State<'_, AppState>) -> Result<(), String> {
+    state.transfers.lock().map_err(|_| "传输管理器已损坏")?
+        .get(&transfer_id).ok_or("传输任务已结束")?.pause(paused)
 }
 
 #[tauri::command]
 async fn open_tool_window(request: ToolWindowRequest, app: AppHandle) -> Result<String, String> {
     match request.kind.as_str() {
-        "file-viewer" => (),
+        "file-viewer" | "sftp" => (),
         _ => return Err("不支持的工具窗口类型".to_string()),
     };
     if request.query.len() > 16_384
@@ -2227,13 +2234,14 @@ async fn open_tool_window(request: ToolWindowRequest, app: AppHandle) -> Result<
     }
     let sequence = TOOL_WINDOW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let label = format!("tool-{}-{}-{sequence}", request.kind, request.scope_id);
+    let page = if request.kind == "sftp" { "index.html" } else { "viewer.html" };
     #[cfg(dev)]
     let viewer_url = tauri::WebviewUrl::External(
-        tauri::Url::parse("http://127.0.0.1:1420/viewer.html")
+        tauri::Url::parse(&format!("http://127.0.0.1:1420/{page}"))
             .map_err(|error| format!("无法创建开发工具窗口地址：{error}"))?,
     );
     #[cfg(not(dev))]
-    let viewer_url = tauri::WebviewUrl::App("viewer.html".into());
+    let viewer_url = tauri::WebviewUrl::App(page.into());
     app.state::<AppState>()
         .tool_window_requests
         .lock()
@@ -2303,7 +2311,7 @@ fn close_current_tool_window(
 }
 
 #[tauri::command]
-fn open_current_devtools(window: tauri::WebviewWindow) -> Result<(), String> {
+fn open_current_devtools(window: tauri::Webview) -> Result<(), String> {
     window.open_devtools();
     Ok(())
 }
@@ -2379,8 +2387,11 @@ fn update_tool_window_preferences(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            let commands: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+            browser::browser_command,
             local_terminal_open,
             local_terminal_read,
             local_terminal_write,
@@ -2418,6 +2429,7 @@ pub fn run() {
             sftp_rename,
             sftp_chmod,
             cancel_transfer,
+            pause_transfer,
             open_tool_window,
             current_tool_window_request,
             close_current_tool_window,
@@ -2425,7 +2437,16 @@ pub fn run() {
             close_tool_windows,
             notify_tool_windows_closed,
             update_tool_window_preferences
-        ])
+            ];
+            move |invoke: tauri::ipc::Invoke| {
+                if invoke.message.webview_ref().label() == browser::LABEL {
+                    invoke.resolver.reject("Browser pages cannot invoke application commands");
+                    true
+                } else {
+                    commands(invoke)
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running Orbiterm");
 }
