@@ -206,6 +206,7 @@ function resizeHarness() {
   const calls = [];
   const host = { isConnected: true, getBoundingClientRect: () => ({ width: 900, height: 600 }) };
   const context = vm.createContext({
+    state: { windowSuspended: false, terminals: new Map() }, detachedSftp: false,
     document: { hidden: false }, window: { innerWidth: 1200, innerHeight: 800 },
     getComputedStyle: () => ({ display: "flex" }), clearTimeout: () => { timer = null; },
     setTimeout: callback => { timer = callback; return 1; }, invoke: (command, args) => { calls.push({ command, args }); return Promise.resolve(); },
@@ -253,6 +254,27 @@ test("fit skips collapsed and minimized terminal hosts", () => {
   h.record.host.getBoundingClientRect = () => ({ width: 900, height: 600 });
   assert.equal(h.context.fitTerminalRecord(h.record), false);
   assert.equal(fits, 1);
+});
+
+test("fit preserves the terminal scroll position", () => {
+  const h = resizeHarness();
+  const scrolls = [];
+  h.record.terminal.buffer = { active: { viewportY: 120, baseY: 500 } };
+  h.record.terminal.scrollToLine = line => { scrolls.push(line); h.record.terminal.buffer.active.viewportY = line; };
+  h.record.terminal.scrollToBottom = () => assert.fail("a scrolled viewport must not jump to the bottom");
+  h.record.fit.fit = () => { h.record.terminal.buffer.active.viewportY = 0; };
+  assert.equal(h.context.fitTerminalRecord(h.record), true);
+  assert.deepEqual(scrolls, [120]);
+});
+
+test("suspended windows skip terminal fitting until focus returns", () => {
+  const h = resizeHarness();
+  let fits = 0;
+  h.record.fit.fit = () => fits++;
+  h.context.state.windowSuspended = true;
+  assert.equal(h.context.fitTerminalRecord(h.record), false);
+  assert.equal(fits, 0);
+  assert.match(source, /window\.addEventListener\("focus", resumeTerminalLayout\)/);
 });
 
 test("new SSH and local terminals never start with transient tiny PTY dimensions", () => {

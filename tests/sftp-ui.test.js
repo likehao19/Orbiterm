@@ -72,6 +72,31 @@ test("SFTP width stays inside the terminal content, including very narrow worksp
   assert.equal(panel.style.width, "280px");
 });
 
+test("native file drag highlights SFTP and uploads dropped paths", () => {
+  const code = section("function handleSftpFileDrag(payload)", "async function openRemoteEditor(");
+  const classes = new Set();
+  const uploads = [];
+  const panel = { dataset: {}, classList: {
+    contains: value => classes.has(value),
+    toggle: (value, force) => force ? classes.add(value) : classes.delete(value),
+    remove: value => classes.delete(value),
+  } };
+  const context = vm.createContext({
+    el: () => panel,
+    activeTerminal: () => ({ connected: true }),
+    uploadPaths: paths => uploads.push(paths),
+    toast() {},
+    tr: value => value,
+  });
+  vm.runInContext(code, context);
+  context.handleSftpFileDrag({ type: "enter" });
+  assert.equal(classes.has("file-drag-active"), true);
+  context.handleSftpFileDrag({ type: "drop", paths: ["C:\\tmp\\a.txt"] });
+  assert.equal(classes.has("file-drag-active"), false);
+  assert.deepEqual(uploads, [["C:\\tmp\\a.txt"]]);
+  assert.match(readFileSync(new URL("../src/styles/v2-tools.css", import.meta.url), "utf8"), /#sftpPanel\.file-drag-active::after/);
+});
+
 function pauseHarness(invoke = async () => {}) {
   const task = { terminalId: "one", status: "running", transferred: 256, total: 1024 };
   const context = vm.createContext({ detachedSftp: false, state: { transferMeta: new Map([["t", task]]) },

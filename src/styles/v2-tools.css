@@ -192,6 +192,7 @@
 
 /* Explorer-style details view, scoped to avoid legacy theme row overrides. */
 #sftpPanel {
+  position: absolute;
   container: sftp / inline-size;
   width: min(var(--sftp-width, 540px), 100%) !important;
   max-width: 100%;
@@ -199,6 +200,21 @@
   background: var(--drawer-bg);
   grid-template-rows: 46px auto 42px 33px minmax(0, 1fr) auto 38px;
   --file-columns: minmax(100px, 1fr) 64px 64px 112px 44px;
+}
+#sftpPanel.file-drag-active::after {
+  position: absolute;
+  z-index: 20;
+  content: attr(data-file-drop-hint);
+  inset: 8px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-2) 88%, transparent);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 650;
+  pointer-events: none;
 }
 #sftpPanel > :not(.sftp-resize) { min-width: 0; }
 #sftpPanel .sftp-head { gap: 4px; }

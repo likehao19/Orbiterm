@@ -159,6 +159,7 @@ const state = {
   monitorTimer: null,
   windowBoundsTimer: null,
   restoringWindowBounds: false,
+  windowSuspended: false,
   autoReconnectCounts: new Map(),
   preferences: loadPreferences(),
 };
@@ -476,6 +477,7 @@ document.querySelector("#app").innerHTML = `
       <div class="dialog-body session-dialog-body">
         <div class="session-form-tabs" role="tablist"><button type="button" class="active" data-session-tab="basic">基本信息</button><button type="button" data-session-tab="auth">认证</button><button type="button" data-session-tab="terminal">终端</button></div>
         <section class="session-form-page" data-session-page="basic">
+          <h2 class="session-page-title">基本信息</h2>
           <div class="field full"><label for="name">连接名称</label><input id="name" required placeholder="例如：生产服务器" /></div>
           <div class="form-grid host-grid"><div class="field"><label for="host">IP / 主机地址</label><input id="host" required placeholder="服务器 IP 或域名" /></div><div class="field"><label for="port">端口</label><input id="port" type="number" min="1" max="65535" value="22" required /></div></div>
           <div class="field full"><label for="username">用户名</label><input id="username" required placeholder="root" /></div>
@@ -483,11 +485,13 @@ document.querySelector("#app").innerHTML = `
           <div id="passwordFields" class="field full"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" placeholder="输入 SSH 登录密码" /><label class="inline-check"><input id="rememberPassword" type="checkbox" /> 使用 Windows 凭据管理器记住密码</label></div>
         </section>
         <section class="session-form-page hidden" data-session-page="auth">
+          <h2 class="session-page-title">认证</h2>
           <div class="field full"><label for="authType">认证方式</label><select id="authType"><option value="password">密码认证</option><option value="publickey">SSH 私钥</option><option value="agent">SSH Agent</option></select></div>
           <div id="keyFields" class="key-fields hidden"><div class="field full"><label for="privateKey">私钥文件</label><div class="input-action"><input id="privateKey" placeholder="选择 OpenSSH 私钥" /><button id="pickKey" type="button">浏览</button></div></div><div class="field full"><label for="passphrase">私钥口令（可选，不保存）</label><input id="passphrase" type="password" /></div></div>
           <p class="setting-note">首次连接会自动保存服务器主机指纹；以后指纹变化时会阻止连接。</p>
         </section>
         <section class="session-form-page hidden" data-session-page="terminal">
+          <h2 class="session-page-title">终端</h2>
           <div class="form-grid advanced-grid"><div class="field"><label for="terminalType">终端类型</label><select id="terminalType"><option>xterm-256color</option><option>xterm</option><option>vt100</option></select></div><div class="field"><label for="timeout">连接超时（秒）</label><input id="timeout" type="number" min="1" max="300" value="20" /></div></div>
           <div class="field full"><label for="shellCommand">启动 Shell / 命令</label><input id="shellCommand" placeholder="留空使用服务器默认 Shell，例如 /bin/bash -l" autocomplete="off" /></div>
           <p class="setting-note">留空时读取远端账户的默认登录 Shell；仅在需要指定 Bash、Zsh 或启动 tmux 时填写。</p>
@@ -569,7 +573,7 @@ document.querySelector("#app").innerHTML = `
       <div class="dialog-foot"><button id="cancelEditor" type="button">关闭</button><button id="saveRemoteEditor" type="button" class="primary" disabled>保存到远端</button></div>
     </section>
   </div>
-  <div id="appPrompt" class="app-prompt hidden"><section><strong id="appPromptTitle"></strong><p id="appPromptMessage"></p><input id="appPromptInput" /><select id="appPromptSelect" class="hidden"></select><div><button id="appPromptCancel">取消</button><button id="appPromptConfirm" class="primary">确定</button></div></section></div>
+  <div id="appPrompt" class="app-prompt hidden" role="dialog" aria-modal="false" aria-labelledby="appPromptTitle" aria-describedby="appPromptMessage"><section><strong id="appPromptTitle"></strong><p id="appPromptMessage"></p><input id="appPromptInput" /><select id="appPromptSelect" class="hidden"></select><div><button id="appPromptCancel">取消</button><button id="appPromptConfirm" class="primary">确定</button></div></section></div>
   <div id="toast" class="toast hidden"></div>
   <div class="overlay" id="paletteOverlay">
     <div class="palette" role="dialog" aria-label="命令面板">
@@ -1289,13 +1293,11 @@ function appPrompt({ title, message = "", value = "", input = true, confirmText 
       root.classList.add("hidden");
       el("appPromptConfirm").onclick = null;
       el("appPromptCancel").onclick = null;
-      root.onclick = null;
       root.onkeydown = null;
       resolve(result);
     };
     el("appPromptConfirm").onclick = () => finish(promptValue());
     el("appPromptCancel").onclick = () => finish(cancelValue());
-    root.onclick = (event) => { if (event.target === root) finish(cancelValue()); };
     root.onkeydown = (event) => {
       if (event.key === "Escape") finish(cancelValue());
       if (event.key === "Enter") finish(promptValue());
@@ -1985,19 +1987,51 @@ async function submitSession(event) {
 }
 
 function hasUsableTerminalGeometry(record) {
-  if (!record?.host?.isConnected || document.hidden || window.innerWidth < 300 || window.innerHeight < 200) return false;
+  if (!record?.host?.isConnected || state.windowSuspended || document.hidden || window.innerWidth < 300 || window.innerHeight < 200) return false;
   const rect = record.host.getBoundingClientRect();
   return rect.width >= 160 && rect.height >= 80 && getComputedStyle(record.host).display !== "none";
 }
 
+function captureTerminalViewport(record) {
+  const buffer = record?.terminal?.buffer?.active;
+  if (!buffer) return null;
+  return { viewportY: buffer.viewportY, atBottom: buffer.viewportY >= buffer.baseY };
+}
+
+function restoreTerminalViewport(record, snapshot) {
+  if (!snapshot || !record?.terminal?.buffer?.active) return;
+  if (snapshot.atBottom) record.terminal.scrollToBottom();
+  else record.terminal.scrollToLine(Math.min(snapshot.viewportY, record.terminal.buffer.active.baseY));
+}
+
 function fitTerminalRecord(record) {
   if (!hasUsableTerminalGeometry(record)) return false;
+  const viewport = captureTerminalViewport(record);
   try {
     record.fit.fit();
+    restoreTerminalViewport(record, viewport);
     return true;
   } catch {
     return false;
   }
+}
+
+function suspendTerminalLayout() {
+  if (detachedSftp || state.windowSuspended) return;
+  state.windowSuspended = true;
+  state.terminals.forEach((record) => { record.suspendedViewport = captureTerminalViewport(record); });
+}
+
+function resumeTerminalLayout() {
+  if (detachedSftp) return;
+  state.windowSuspended = false;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    state.terminals.forEach((record) => {
+      fitTerminalRecord(record);
+      restoreTerminalViewport(record, record.suspendedViewport);
+      record.suspendedViewport = null;
+    });
+  }));
 }
 
 function scheduleTerminalResize(record, cols, rows) {
@@ -3225,6 +3259,21 @@ async function uploadFile() {
   await uploadPaths(Array.isArray(selection) ? selection : [selection]);
 }
 
+function handleSftpFileDrag(payload) {
+  const panel = el("sftpPanel");
+  const available = !panel.classList.contains("hidden") && Boolean(activeTerminal()?.connected);
+  if (payload.type === "enter" || payload.type === "over") {
+    panel.dataset.fileDropHint = tr("释放以上传到当前目录", "Drop to upload into this folder");
+    panel.classList.toggle("file-drag-active", available);
+    return;
+  }
+  panel.classList.remove("file-drag-active");
+  delete panel.dataset.fileDropHint;
+  if (payload.type !== "drop") return;
+  if (!available) return toast(tr("请先打开 SFTP 文件管理器", "Open the SFTP file manager first"), "error");
+  if (Array.isArray(payload.paths) && payload.paths.length) void uploadPaths(payload.paths);
+}
+
 function binaryToHex(base64) {
   const normalized = base64.replaceAll("-", "+").replaceAll("_", "/");
   const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
@@ -4233,7 +4282,7 @@ async function syncMaximizeButton() {
   button.setAttribute("aria-label", button.title);
 }
 
-el("minimize").addEventListener("click", () => appWindow.minimize());
+el("minimize").addEventListener("click", () => { suspendTerminalLayout(); void appWindow.minimize(); });
 el("maximize").addEventListener("click", async () => { await appWindow.toggleMaximize(); await syncMaximizeButton(); });
 if (isTauri) {
   appWindow.onResized(() => { void syncMaximizeButton(); scheduleWindowBoundsSave(); });
@@ -5006,7 +5055,13 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("#groupContextMenu,#sessionLibContextMenu")) hideGroupMenus();
   if (!event.target.closest("#sftpContextMenu,#newRemoteMenu,#newRemote")) hideSftpMenus();
 });
-window.addEventListener("blur", () => { hideTerminalContextMenu(); hideTabContextMenu(); hideGroupMenus(); });
+window.addEventListener("blur", () => {
+  suspendTerminalLayout();
+  hideTerminalContextMenu();
+  hideTabContextMenu();
+  hideGroupMenus();
+});
+window.addEventListener("focus", resumeTerminalLayout);
 window.addEventListener("resize", () => {
   setSftpWidth(state.preferences.sftpWidth);
   setDrawerWidth("tail", state.preferences.tailWidth);
@@ -5050,12 +5105,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 if (isTauri) {
-  appWindow.onDragDropEvent(({ payload }) => {
-    if (payload.type === "drop") {
-      if (el("sftpPanel").classList.contains("hidden")) return toast(tr("请先打开 SFTP 文件管理器", "Open the SFTP file manager first"), "error");
-      void uploadPaths(payload.paths);
-    }
-  }).catch(() => {});
+  appWindow.onDragDropEvent(({ payload }) => handleSftpFileDrag(payload)).catch(() => {});
   appWindow.onCloseRequested((event) => {
     event.preventDefault();
     void requestAppClose();

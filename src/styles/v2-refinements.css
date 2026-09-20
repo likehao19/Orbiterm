@@ -248,56 +248,6 @@
   display: none;
 }
 
-.terminal-host .xterm .xterm-cursor.xterm-cursor-bar,
-.terminal-host .xterm .xterm-cursor.xterm-cursor-block,
-.terminal-host .xterm .xterm-cursor.xterm-cursor-underline {
-  position: relative;
-  box-shadow: none !important;
-  animation: none !important;
-  background: transparent !important;
-  outline: none !important;
-}
-.terminal-host .xterm .xterm-cursor.xterm-cursor-bar::before,
-.terminal-host .xterm .xterm-cursor.xterm-cursor-block::before,
-.terminal-host .xterm .xterm-cursor.xterm-cursor-underline::before {
-  content: "";
-  position: absolute;
-  background: var(--term-cursor, #22d3ee);
-  box-shadow: 0 0 8px color-mix(in srgb, var(--term-cursor, #22d3ee) 50%, transparent);
-  pointer-events: none;
-}
-.terminal-host .xterm .xterm-cursor.xterm-cursor-bar::before {
-  left: 0;
-  top: 50%;
-  width: max(2px, calc(var(--term-font-size, 13px) * 0.42));
-  height: calc(var(--term-font-size, 13px) * 1.05);
-  margin-top: calc(var(--term-font-size, 13px) * -0.525);
-  border-radius: 1.5px;
-}
-.terminal-host .xterm .xterm-cursor.xterm-cursor-block::before {
-  inset: 1px 0;
-  border-radius: 2px;
-  opacity: 0.88;
-}
-.terminal-host .xterm .xterm-cursor.xterm-cursor-underline::before {
-  left: 0;
-  right: 0;
-  top: auto;
-  bottom: 1px;
-  height: max(2px, calc(var(--term-font-size, 13px) * 0.16));
-  border-radius: 1px;
-}
-.terminal-host .xterm.focus .xterm-cursor.xterm-cursor-blink.xterm-cursor-bar::before,
-.terminal-host .xterm.focus .xterm-cursor.xterm-cursor-blink.xterm-cursor-block::before,
-.terminal-host .xterm.focus .xterm-cursor.xterm-cursor-blink.xterm-cursor-underline::before {
-  animation: caret-blink 1.06s steps(1) infinite;
-}
-@keyframes caret-blink { 50% { opacity: 0; } }
-.terminal-host[data-term-theme="light"] .xterm .xterm-cursor.xterm-cursor-bar::before,
-.terminal-host[data-term-theme="light"] .xterm .xterm-cursor.xterm-cursor-block::before,
-.terminal-host[data-term-theme="light"] .xterm .xterm-cursor.xterm-cursor-underline::before {
-  box-shadow: 0 0 6px color-mix(in srgb, var(--term-cursor, #0891b2) 38%, transparent);
-}
 .terminal-host.terminal-bell {
   animation: terminal-bell-flash 0.24s ease-out;
 }

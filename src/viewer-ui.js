@@ -21,7 +21,7 @@ export function renderViewerUi() {
       <section id="findBar" class="find-bar hidden"><input id="findInput" placeholder="查找内容" /><small id="findCount"></small><button id="findPrevious" title="上一个">↑</button><button id="findNext" title="下一个">↓</button><button id="closeFind" title="关闭">×</button></section>
       <section class="editor-area"><pre id="lineNumbers"></pre><textarea id="editor" readonly spellcheck="false" wrap="off"></textarea><div id="loading" class="loading"><i></i><span id="loadingText">正在读取远程文件…</span></div></section>
       <footer><span id="encoding">—</span><span id="fileSize">—</span><span id="status">只读预览</span><button id="loadMore" class="secondary hidden">继续加载</button><button id="saveFile" disabled>保存到远端</button></footer>
-      <div id="confirmClose" class="viewer-confirm hidden" role="dialog" aria-modal="true" aria-labelledby="confirmCloseTitle"><section><header><strong id="confirmCloseTitle">放弃修改</strong></header><div><p id="confirmCloseMessage">文件有未保存的修改，确定放弃吗？</p><footer><button id="keepEditing">继续编辑</button><button id="discardChanges" class="primary danger">放弃并关闭</button></footer></div></section></div>
+      <div id="confirmClose" class="viewer-confirm hidden" role="dialog" aria-modal="false" aria-labelledby="confirmCloseTitle"><section><header><strong id="confirmCloseTitle">放弃修改</strong></header><div><p id="confirmCloseMessage">文件有未保存的修改，确定放弃吗？</p><footer><button id="keepEditing">继续编辑</button><button id="discardChanges" class="primary danger">放弃并关闭</button></footer></div></section></div>
       <div id="toast" class="viewer-toast hidden"></div>
     </main>`;
 }

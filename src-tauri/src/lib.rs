@@ -957,6 +957,10 @@ fn remote_transfer_path(path: &str, transfer_id: &str) -> String {
     format!("{path}.orbiterm-part-{transfer_id}")
 }
 
+fn remote_backup_path(path: &str, transfer_id: &str) -> String {
+    format!("{path}.orbiterm-backup-{transfer_id}")
+}
+
 #[tauri::command]
 async fn sftp_read_text(
     id: String,
@@ -1064,7 +1068,7 @@ async fn sftp_write_text(
         tauri::async_runtime::spawn_blocking(move || {
             let sftp = sftp.lock().map_err(|_| "SFTP 连接已损坏".to_string())?;
             let temp_path = remote_transfer_path(&path, "editor");
-            let backup_path = format!("{path}.orbiterm-backup-editor");
+            let backup_path = remote_backup_path(&path, "editor");
             let original_permissions = sftp.stat(Path::new(&path)).ok().and_then(|stat| stat.perm);
             let result = (|| {
                 let mut target = sftp
@@ -1733,7 +1737,12 @@ async fn sftp_upload(
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             let temp_path = remote_transfer_path(&remote_path, &transfer_id);
+            let backup_path = remote_backup_path(&remote_path, &transfer_id);
+            let original_stat = sftp.stat(Path::new(&remote_path)).ok();
             let result = (|| {
+                if original_stat.as_ref().is_some_and(FileStat::is_dir) {
+                    return Err("远程目标是同名目录，不能使用文件覆盖".to_string());
+                }
                 let mut target = sftp
                     .create(Path::new(&temp_path))
                     .map_err(|error| format!("无法创建远程临时文件：{error}"))?;
@@ -1770,23 +1779,66 @@ async fn sftp_upload(
                     .flush()
                     .map_err(|error| format!("刷新远程文件失败：{error}"))?;
                 drop(target);
-                sftp.rename(
-                    Path::new(&temp_path),
-                    Path::new(&remote_path),
-                    Some(RenameFlags::OVERWRITE | RenameFlags::ATOMIC),
-                )
-                .or_else(|_| {
-                    sftp.rename(
+                if let Some(permissions) = original_stat.as_ref().and_then(|stat| stat.perm) {
+                    sftp.setstat(
+                        Path::new(&temp_path),
+                        FileStat {
+                            size: None,
+                            uid: None,
+                            gid: None,
+                            perm: Some(permissions),
+                            atime: None,
+                            mtime: None,
+                        },
+                    )
+                    .map_err(|error| format!("保留远程文件权限失败：{error}"))?;
+                }
+                if sftp
+                    .rename(
                         Path::new(&temp_path),
                         Path::new(&remote_path),
-                        Some(RenameFlags::OVERWRITE),
+                        Some(RenameFlags::OVERWRITE | RenameFlags::ATOMIC),
                     )
-                })
-                .map_err(|error| format!("提交远程文件失败：{error}"))?;
+                    .or_else(|_| {
+                        sftp.rename(
+                            Path::new(&temp_path),
+                            Path::new(&remote_path),
+                            Some(RenameFlags::OVERWRITE),
+                        )
+                    })
+                    .is_ok()
+                {
+                    return Ok(transferred);
+                }
+
+                if original_stat.is_none() {
+                    sftp.rename(Path::new(&temp_path), Path::new(&remote_path), None)
+                        .map_err(|error| format!("提交远程文件失败：{error}"))?;
+                    return Ok(transferred);
+                }
+
+                sftp.unlink(Path::new(&backup_path)).ok();
+                sftp.rename(Path::new(&remote_path), Path::new(&backup_path), None)
+                    .map_err(|error| format!("备份远程原文件失败：{error}"))?;
+                if let Err(error) =
+                    sftp.rename(Path::new(&temp_path), Path::new(&remote_path), None)
+                {
+                    sftp.rename(Path::new(&backup_path), Path::new(&remote_path), None)
+                        .ok();
+                    return Err(format!("提交远程文件失败：{error}"));
+                }
+                sftp.unlink(Path::new(&backup_path)).ok();
                 Ok(transferred)
             })();
             if result.is_err() {
                 sftp.unlink(Path::new(&temp_path)).ok();
+                if original_stat.is_some()
+                    && sftp.stat(Path::new(&remote_path)).is_err()
+                    && sftp.stat(Path::new(&backup_path)).is_ok()
+                {
+                    sftp.rename(Path::new(&backup_path), Path::new(&remote_path), None)
+                        .ok();
+                }
             }
             result
         })
@@ -2495,6 +2547,10 @@ mod tests {
         assert_eq!(
             remote_transfer_path("/srv/app.tar", "abc"),
             "/srv/app.tar.orbiterm-part-abc"
+        );
+        assert_eq!(
+            remote_backup_path("/srv/app.tar", "abc"),
+            "/srv/app.tar.orbiterm-backup-abc"
         );
         assert_eq!(
             suffixed_local_path(Path::new("report.log"), ".part"),
